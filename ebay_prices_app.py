@@ -1,6 +1,8 @@
 import os
 import requests
 from flask import Flask, jsonify, request
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 app = Flask(__name__)
 
@@ -10,6 +12,21 @@ EBAY_DEV_ID = os.environ.get('EBAY_DEV_ID')
 EBAY_CERT_ID = os.environ.get('EBAY_CERT_ID')
 
 EBAY_FINDING_URL = "https://svcs.ebay.com/services/search/FindingService/v1"
+
+# Configure requests session with retries
+def get_requests_session():
+    session = requests.Session()
+    retry = Retry(
+        total=2,
+        read=2,
+        connect=2,
+        backoff_factor=0.5,
+        status_forcelist=[500, 502, 503, 504]
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount('http://', adapter)
+    session.mount('https://', adapter)
+    return session
 
 @app.route('/health', methods=['GET'])
 def health():
@@ -46,7 +63,8 @@ def search_ebay():
             'paginationInput.entriesPerPage': '100'
         }
         
-        response = requests.get(EBAY_FINDING_URL, params=params, timeout=10)
+        session = get_requests_session()
+        response = session.get(EBAY_FINDING_URL, params=params, timeout=20)
         response.raise_for_status()
         
         data = response.json()
@@ -141,7 +159,8 @@ def search_upc():
             'paginationInput.entriesPerPage': '20'
         }
         
-        response = requests.get(EBAY_FINDING_URL, params=params, timeout=10)
+        session = get_requests_session()
+        response = session.get(EBAY_FINDING_URL, params=params, timeout=20)
         response.raise_for_status()
         
         data = response.json()
