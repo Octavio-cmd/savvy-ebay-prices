@@ -14,17 +14,17 @@ EBAY_CERT_ID = os.environ.get('EBAY_CERT_ID')
 
 EBAY_FINDING_URL = "https://svcs.ebay.com/services/search/FindingService/v1"
 
-# Configure requests session with retries
+# Configure requests session with retries and longer timeout
 def get_requests_session():
     session = requests.Session()
     retry = Retry(
-        total=2,
-        read=2,
-        connect=2,
-        backoff_factor=0.5,
+        total=1,
+        read=1,
+        connect=1,
+        backoff_factor=0.3,
         status_forcelist=[500, 502, 503, 504]
     )
-    adapter = HTTPAdapter(max_retries=retry)
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
     session.mount('http://', adapter)
     session.mount('https://', adapter)
     return session
@@ -65,7 +65,8 @@ def search_ebay():
         }
         
         session = get_requests_session()
-        response = session.get(EBAY_FINDING_URL, params=params, timeout=20)
+        # TIMEOUT INCREASED TO 60 SECONDS
+        response = session.get(EBAY_FINDING_URL, params=params, timeout=60)
         response.raise_for_status()
         
         data = response.json()
@@ -149,13 +150,13 @@ def search_ebay():
         }), 200
     
     except requests.exceptions.Timeout:
-        app.logger.error("eBay API timeout - took longer than 20 seconds")
+        app.logger.error("eBay API timeout on /search - took longer than 60 seconds")
         return jsonify({"error": "eBay API timeout - request took too long"}), 504
     except requests.exceptions.ConnectionError as e:
-        app.logger.error(f"eBay connection error: {str(e)}")
+        app.logger.error(f"eBay connection error on /search: {str(e)}")
         return jsonify({"error": f"Cannot connect to eBay: {str(e)}"}), 503
     except requests.RequestException as e:
-        app.logger.error(f"eBay request error: {str(e)}")
+        app.logger.error(f"eBay request error on /search: {str(e)}")
         return jsonify({"error": f"eBay API error: {str(e)}"}), 500
     except Exception as e:
         app.logger.error(f"Unexpected error in /search: {str(e)}")
@@ -190,7 +191,8 @@ def search_upc():
         }
         
         session = get_requests_session()
-        response = session.get(EBAY_FINDING_URL, params=params, timeout=20)
+        # TIMEOUT INCREASED TO 60 SECONDS
+        response = session.get(EBAY_FINDING_URL, params=params, timeout=60)
         response.raise_for_status()
         
         data = response.json()
@@ -294,13 +296,13 @@ def search_upc():
         }), 200
     
     except requests.exceptions.Timeout:
-        app.logger.error("eBay API timeout on UPC search - took longer than 20 seconds")
+        app.logger.error("eBay API timeout on /search-upc - took longer than 60 seconds")
         return jsonify({"error": "eBay API timeout - request took too long"}), 504
     except requests.exceptions.ConnectionError as e:
-        app.logger.error(f"eBay connection error on UPC search: {str(e)}")
+        app.logger.error(f"eBay connection error on /search-upc: {str(e)}")
         return jsonify({"error": f"Cannot connect to eBay: {str(e)}"}), 503
     except requests.RequestException as e:
-        app.logger.error(f"eBay request error on UPC search: {str(e)}")
+        app.logger.error(f"eBay request error on /search-upc: {str(e)}")
         return jsonify({"error": f"eBay API error: {str(e)}"}), 500
     except Exception as e:
         app.logger.error(f"Unexpected error in /search-upc: {str(e)}")
