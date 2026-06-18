@@ -1,482 +1,345 @@
-import os
+"""
+SAVVY SCANNER - Backend con ALGOPIX API
+Reemplaza la búsqueda de eBay Catalog API con Algopix Product Analysis API
+Optimizado para 5,000 lookups/mes
+
+Instalación de dependencias:
+pip install flask requests python-dotenv
+"""
+
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 import requests
+import os
 import json
-import base64
-from flask import Flask, jsonify, request
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-import time
+from datetime import datetime
+import logging
+
+# Configuración de logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+CORS(app)
 
-# Environment variables (set in Railway)
-EBAY_APP_ID = os.environ.get('EBAY_APP_ID')
-EBAY_DEV_ID = os.environ.get('EBAY_DEV_ID')
-EBAY_CERT_ID = os.environ.get('EBAY_CERT_ID')
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# CONFIGURACIÓN DE ALGOPIX
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-# eBay API endpoints
-EBAY_OAUTH_URL = "https://api.ebay.com/identity/v1/oauth2/token"
-EBAY_CATALOG_SEARCH_URL = "https://api.ebay.com/commerce/catalog/v1_beta/product_summary/search"
-EBAY_CATALOG_PRODUCT_URL = "https://api.ebay.com/commerce/catalog/v1_beta/product"
-EBAY_BROWSE_SEARCH_URL = "https://api.ebay.com/buy/browse/v1/item_summary/search"
+ALGOPIX_APP_ID = "2pTW5BzPQdYishB6AiRMNE"
+ALGOPIX_API_KEY = "2xdVJ17VPIinxRhMpg87Mm7I8ucYh7jnp6VGVc9u"
+ALGOPIX_API_URL = "https://api.algopix.com/v1"
 
-# Global token cache
-_token_cache = {"token": None, "expires_at": 0}
+# Headers para Algopix
+ALGOPIX_HEADERS = {
+    "app-id": ALGOPIX_APP_ID,
+    "app-key": ALGOPIX_API_KEY,
+    "Content-Type": "application/json"
+}
 
-def get_requests_session():
-    """Configure requests session with retries and longer timeout"""
-    session = requests.Session()
-    retry = Retry(
-        total=2,
-        read=2,
-        connect=2,
-        backoff_factor=0.5,
-        status_forcelist=[500, 502, 503, 504]
-    )
-    adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
-    session.mount('http://', adapter)
-    session.mount('https://', adapter)
-    return session
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# CACHÉ EN MEMORIA (Optimiza lookups)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def get_oauth_token():
-    """
-    Get OAuth token from eBay using Client Credentials flow
-    Uses App ID (Client ID) and Cert ID (Client Secret)
-    """
-    global _token_cache
-    
-    # Return cached token if still valid
-    if _token_cache["token"] and time.time() < _token_cache["expires_at"]:
-        return _token_cache["token"]
-    
-    if not all([EBAY_APP_ID, EBAY_CERT_ID]):
-        app.logger.error("Missing eBay credentials for OAuth")
-        return None
-    
-    try:
-        # Encode credentials
-        credentials = f"{EBAY_APP_ID}:{EBAY_CERT_ID}"
-        credentials_b64 = base64.b64encode(credentials.encode()).decode()
-        
-        headers = {
-            "Authorization": f"Basic {credentials_b64}",
-            "Content-Type": "application/x-www-form-urlencoded"
-        }
-        
-        data = {
-            "grant_type": "client_credentials",
-            "scope": "https://api.ebay.com/oauth/api_scope"
-        }
-        
-        session = get_requests_session()
-        response = session.post(EBAY_OAUTH_URL, headers=headers, data=data, timeout=30)
-        response.raise_for_status()
-        
-        token_data = response.json()
-        token = token_data.get('access_token')
-        expires_in = token_data.get('expires_in', 3600)
-        
-        if token:
-            # Cache token (expires in 1 hour, refresh at 55 minutes)
-            _token_cache["token"] = token
-            _token_cache["expires_at"] = time.time() + (expires_in - 300)
-            app.logger.info("OAuth token obtained successfully")
-            return token
-        else:
-            app.logger.error("No access_token in eBay response")
-            return None
-            
-    except requests.exceptions.RequestException as e:
-        app.logger.error(f"OAuth token request failed: {str(e)}")
-        return None
+CACHE = {}
+LOOKUP_COUNT = {
+    "total": 0,
+    "today": 0,
+    "reset_date": datetime.now().strftime("%Y-%m-%d")
+}
 
-def search_catalog_by_upc(upc):
-    """
-    Search eBay Catalog by UPC/GTIN
-    Returns product details: epid, title, description, images, aspects
-    """
-    token = get_oauth_token()
-    if not token:
-        return None
-    
-    try:
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/json"
-        }
-        
-        params = {
-            "gtin": upc,
-            "limit": 5
-        }
-        
-        session = get_requests_session()
-        response = session.get(EBAY_CATALOG_SEARCH_URL, headers=headers, params=params, timeout=60)
-        response.raise_for_status()
-        
-        data = response.json()
-        return data
-        
-    except requests.exceptions.RequestException as e:
-        app.logger.error(f"Catalog API request failed: {str(e)}")
-        return None
-
-def get_catalog_product_details(epid):
-    """
-    Get full product details from eBay Catalog using ePID
-    Returns: title, description, aspects, images, UPC, EAN, ISBN
-    """
-    token = get_oauth_token()
-    if not token:
-        return None
-    
-    try:
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/json"
-        }
-        
-        url = f"{EBAY_CATALOG_PRODUCT_URL}/{epid}"
-        
-        session = get_requests_session()
-        response = session.get(url, headers=headers, timeout=60)
-        response.raise_for_status()
-        
-        data = response.json()
-        return data
-        
-    except requests.exceptions.RequestException as e:
-        app.logger.error(f"Catalog Product API request failed: {str(e)}")
-        return None
-
-def search_browse_for_items(epid):
-    """
-    Search eBay Browse API for items listed with specific ePID
-    Returns current prices and availability
-    """
-    token = get_oauth_token()
-    if not token:
-        return None
-    
-    try:
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/json"
-        }
-        
-        params = {
-            "epid": epid,
-            "limit": 50,
-            "sort": "price"
-        }
-        
-        session = get_requests_session()
-        response = session.get(EBAY_BROWSE_SEARCH_URL, headers=headers, params=params, timeout=60)
-        response.raise_for_status()
-        
-        data = response.json()
-        return data
-        
-    except requests.exceptions.RequestException as e:
-        app.logger.error(f"Browse API request failed: {str(e)}")
-        return None
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# RUTAS PRINCIPALES
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({"status": "ok"}), 200
+    """Health check endpoint"""
+    return jsonify({
+        "status": "online",
+        "service": "Savvy Scanner - Algopix Backend",
+        "timestamp": datetime.now().isoformat(),
+        "lookups_today": LOOKUP_COUNT["today"],
+        "lookups_total": LOOKUP_COUNT["total"]
+    })
 
-@app.route('/search', methods=['GET'])
-def search_ebay():
-    """
-    GET /search?q=keyword&size=XL
-    Returns: {found, query, listings, stats}
-    """
-    query = request.args.get('q', '')
-    size = request.args.get('size', '')
-    
-    if not query:
-        return jsonify({"error": "Missing 'q' parameter"}), 400
-    
-    search_query = f"{query} {size}".strip()
-    
-    try:
-        # For keyword search, use Browse API directly
-        data = search_browse_api(search_query)
-        
-        if not data:
-            return jsonify({
-                "found": False,
-                "query": search_query,
-                "listings": 0,
-                "error": "eBay API returned no data"
-            }), 503
-        
-        items = data.get('itemSummaries', [])
-        
-        if not items:
-            return jsonify({
-                "found": False,
-                "query": search_query,
-                "listings": 0
-            }), 200
-        
-        # Extract and sort by price
-        listings = []
-        for item in items[:10]:  # Top 10
-            try:
-                price_obj = item.get('price', {})
-                price_value = price_obj.get('value') if isinstance(price_obj, dict) else None
-                
-                listing = {
-                    "id": item.get('itemId'),
-                    "title": item.get('title', 'N/A'),
-                    "price": float(price_value) if price_value else None,
-                    "url": item.get('itemWebUrl', ''),
-                    "image": item.get('image', {}).get('imageUrl', '')
-                }
-                listings.append(listing)
-            except Exception as e:
-                app.logger.warning(f"Error parsing item: {str(e)}")
-                continue
-        
-        # Sort by price
-        listings.sort(key=lambda x: x['price'] if x['price'] else float('inf'))
-        
-        if not listings:
-            return jsonify({
-                "found": False,
-                "query": search_query,
-                "listings": 0
-            }), 200
-        
-        min_price = listings[0]['price']
-        max_price = listings[-1]['price']
-        avg_price = sum(l['price'] for l in listings if l['price']) / len([l for l in listings if l['price']]) if listings else 0
-        
-        return jsonify({
-            "found": True,
-            "query": search_query,
-            "listings": len(listings),
-            "stats": {
-                "minPrice": min_price,
-                "maxPrice": max_price,
-                "avgPrice": round(avg_price, 2)
-            },
-            "items": listings
-        }), 200
-        
-    except Exception as e:
-        app.logger.error(f"Search error: {str(e)}")
-        return jsonify({"error": str(e)}), 500
-
-def search_browse_api(keywords):
-    """Helper function to search Browse API by keywords"""
-    token = get_oauth_token()
-    if not token:
-        return None
-    
-    try:
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/json"
-        }
-        
-        params = {
-            "q": keywords,
-            "limit": 50,
-            "sort": "price"
-        }
-        
-        session = get_requests_session()
-        response = session.get(EBAY_BROWSE_SEARCH_URL, headers=headers, params=params, timeout=60)
-        response.raise_for_status()
-        
-        data = response.json()
-        return data
-        
-    except requests.exceptions.RequestException as e:
-        app.logger.error(f"Browse API request failed: {str(e)}")
-        return None
 
 @app.route('/search-upc', methods=['GET'])
 def search_upc():
     """
-    GET /search-upc?upc=071214003222
-    Returns: {found, upc, product_details, listings, stats}
-    """
-    upc = request.args.get('upc', '')
+    Búsqueda por UPC usando Algopix API
     
-    if not upc:
-        return jsonify({"error": "Missing 'upc' parameter"}), 400
+    Parámetros:
+    - upc: Código UPC a buscar (ej: 886227362638)
+    - search_term: (Opcional) Búsqueda por texto alternativa
+    
+    Retorna:
+    - Precio eBay actual
+    - Precio Amazon actual
+    - Precio Walmart actual
+    - Estimación de demanda
+    - Competencia
+    - Margen sugerido
+    """
+    
+    upc = request.args.get('upc', '').strip()
+    search_term = request.args.get('search_term', '').strip()
+    
+    # Validación
+    if not upc and not search_term:
+        return jsonify({
+            "error": "Debe proporcionar UPC o search_term",
+            "status": "error"
+        }), 400
+    
+    # ← CACHÉ: Si ya buscamos esto, devolver respuesta cached
+    cache_key = f"upc_{upc}" if upc else f"search_{search_term}"
+    if cache_key in CACHE:
+        logger.info(f"✅ CACHE HIT: {cache_key}")
+        return jsonify({
+            "data": CACHE[cache_key],
+            "cached": True,
+            "message": "Datos obtenidos del caché (sin usar lookup)"
+        })
+    
+    logger.info(f"🔍 Buscando en Algopix: {upc or search_term}")
     
     try:
-        # STEP 1: Search Catalog API by UPC/GTIN
-        app.logger.info(f"Searching Catalog API for UPC: {upc}")
-        catalog_data = search_catalog_by_upc(upc)
+        # Llamar a Algopix Product Analysis API
+        response = _call_algopix_product_analysis(upc, search_term)
         
-        if not catalog_data:
+        if response.get("status") == "success":
+            # Guardar en caché para futuras búsquedas
+            CACHE[cache_key] = response.get("data", {})
+            
+            # Incrementar contador de lookups
+            LOOKUP_COUNT["total"] += 1
+            LOOKUP_COUNT["today"] += 1
+            
+            logger.info(f"✅ Algopix response exitosa. Lookups hoy: {LOOKUP_COUNT['today']}")
+            
             return jsonify({
-                "found": False,
-                "upc": upc,
-                "error": "Catalog API returned no data"
-            }), 503
+                "data": response.get("data"),
+                "status": "success",
+                "cached": False,
+                "lookups_remaining_today": max(0, int(5000 / 30) - LOOKUP_COUNT["today"])
+            })
+        else:
+            return jsonify(response), 400
+            
+    except Exception as e:
+        logger.error(f"❌ Error en search-upc: {str(e)}")
+        return jsonify({
+            "error": f"Error al buscar en Algopix: {str(e)}",
+            "status": "error"
+        }), 500
+
+
+@app.route('/test-algopix', methods=['GET'])
+def test_algopix():
+    """
+    Test endpoint para verificar conexión con Algopix
+    Usa un UPC de prueba conocido
+    """
+    
+    logger.info("🧪 Testing Algopix connection...")
+    
+    try:
+        # UPC de prueba (Nike shoes - product común)
+        test_upc = "886227362638"
         
-        product_summaries = catalog_data.get('productSummaries', [])
+        response = _call_algopix_product_analysis(test_upc, None)
         
-        if not product_summaries:
-            return jsonify({
-                "found": False,
-                "upc": upc,
-                "listings": 0,
-                "error": "UPC not found in eBay Catalog"
-            }), 200
+        return jsonify({
+            "test_upc": test_upc,
+            "response": response,
+            "timestamp": datetime.now().isoformat()
+        })
         
-        # Get first matching product
-        first_product = product_summaries[0]
-        epid = first_product.get('epid')
-        
-        if not epid:
-            return jsonify({
-                "found": False,
-                "upc": upc,
-                "error": "No ePID found for this UPC"
-            }), 400
-        
-        # STEP 2: Get full product details from Catalog
-        app.logger.info(f"Fetching full details for ePID: {epid}")
-        product_details = get_catalog_product_details(epid)
-        
-        # Prepare product info from Catalog
-        product_info = {
-            "epid": epid,
-            "title": first_product.get('title', 'N/A'),
-            "image": first_product.get('image', {}).get('imageUrl', '') if first_product.get('image') else '',
-            "description": product_details.get('description', '') if product_details else '',
-            "aspects": first_product.get('aspects', []) if first_product.get('aspects') else []
+    except Exception as e:
+        logger.error(f"❌ Error en test: {str(e)}")
+        return jsonify({
+            "error": f"Test failed: {str(e)}",
+            "status": "error"
+        }), 500
+
+
+@app.route('/quota', methods=['GET'])
+def quota():
+    """Muestra cuota de lookups usado y restante"""
+    
+    lookups_used = LOOKUP_COUNT["total"]
+    lookups_remaining = 5000 - lookups_used
+    percentage_used = (lookups_used / 5000) * 100
+    
+    return jsonify({
+        "plan": "Algopix API - 5,000 lookups/mes",
+        "lookups_total": 5000,
+        "lookups_used": lookups_used,
+        "lookups_remaining": lookups_remaining,
+        "percentage_used": f"{percentage_used:.1f}%",
+        "lookups_today": LOOKUP_COUNT["today"],
+        "reset_date": LOOKUP_COUNT["reset_date"],
+        "status": "active" if lookups_remaining > 0 else "exceeded"
+    })
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# FUNCIONES AUXILIARES - ALGOPIX
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def _call_algopix_product_analysis(upc, search_term):
+    """
+    Llama a Algopix Product Analysis API
+    
+    Retorna:
+    {
+        "status": "success" | "error",
+        "data": {
+            "upc": "...",
+            "name": "...",
+            "ebay_price": 45.99,
+            "amazon_price": 42.50,
+            "walmart_price": 48.00,
+            "demand": "HIGH" | "MEDIUM" | "LOW",
+            "competition_level": "MEDIUM",
+            "sellers_count": 25,
+            "suggested_price": 52.00,
+            "margin_suggestion": "Vende a $52 (ganancia $12)"
+        }
+    }
+    """
+    
+    try:
+        # Construir parámetros para Algopix
+        payload = {
+            "marketplaces": ["amazon_us", "ebay_us", "walmart_us"],
+            "country_id": "US",
+            "currency": "USD"
         }
         
-        # STEP 3: Search Browse API for actual listings with this ePID
-        app.logger.info(f"Searching Browse API for listings with ePID: {epid}")
-        browse_data = search_browse_for_items(epid)
+        # Usar UPC o search_term
+        if upc:
+            payload["gtin"] = upc
+        else:
+            payload["search_term"] = search_term
         
-        items = browse_data.get('itemSummaries', []) if browse_data else []
+        # Llamar a Algopix Product Analysis API
+        url = f"{ALGOPIX_API_URL}/products/search"
         
-        if not items:
-            # No current listings, but we have catalog data
-            return jsonify({
-                "found": True,
-                "upc": upc,
-                "product": product_info,
-                "listings": 0,
-                "items": [],
-                "note": "Product found in catalog but no active listings"
-            }), 200
+        logger.info(f"📡 Llamando a Algopix: {url}")
+        logger.info(f"   Payload: {payload}")
         
-        # Extract and sort by price
-        listings = []
-        for item in items[:10]:  # Top 10
-            try:
-                price_obj = item.get('price', {})
-                price_value = price_obj.get('value') if isinstance(price_obj, dict) else None
+        response = requests.post(
+            url,
+            json=payload,
+            headers=ALGOPIX_HEADERS,
+            timeout=10
+        )
+        
+        logger.info(f"📬 Status code: {response.status_code}")
+        
+        # Parsear respuesta
+        data = response.json()
+        
+        if response.status_code == 200 and data.get("status") == "success":
+            # Extraer datos del producto
+            products = data.get("data", [])
+            
+            if products:
+                product = products[0]  # Primer resultado
                 
-                listing = {
-                    "id": item.get('itemId'),
-                    "seller": item.get('seller', {}).get('username', 'Unknown') if item.get('seller') else 'Unknown',
-                    "title": item.get('title', 'N/A'),
-                    "price": float(price_value) if price_value else None,
-                    "condition": item.get('condition', 'Unknown'),
-                    "url": item.get('itemWebUrl', ''),
-                    "image": item.get('image', {}).get('imageUrl', '')
+                # Formatear respuesta
+                formatted_data = {
+                    "upc": upc or search_term,
+                    "name": product.get("product_name", "Unknown"),
+                    "brand": product.get("brand", ""),
+                    "category": product.get("category", ""),
+                    "image_url": product.get("image_url", ""),
+                    
+                    # PRECIOS (marketplace específicos)
+                    "ebay_price": product.get("ebay_price", 0),
+                    "amazon_price": product.get("amazon_price", 0),
+                    "walmart_price": product.get("walmart_price", 0),
+                    
+                    # DEMANDA Y COMPETENCIA
+                    "demand_level": product.get("demand_level", "UNKNOWN"),
+                    "competition_level": product.get("competition_level", "UNKNOWN"),
+                    "sellers_count": product.get("sellers_count", 0),
+                    "sales_rank": product.get("sales_rank", ""),
+                    
+                    # MARGEN SUGERIDO
+                    "suggested_price": product.get("suggested_price", 0),
+                    "margin": _calculate_margin(
+                        product.get("ebay_price", 0),
+                        product.get("suggested_price", 0)
+                    ),
+                    
+                    # INFORMACIÓN ADICIONAL
+                    "found": True,
+                    "timestamp": datetime.now().isoformat()
                 }
-                listings.append(listing)
-            except Exception as e:
-                app.logger.warning(f"Error parsing item: {str(e)}")
-                continue
-        
-        # Sort by price
-        listings.sort(key=lambda x: x['price'] if x['price'] else float('inf'))
-        
-        if listings:
-            min_price = listings[0]['price']
-            max_price = listings[-1]['price']
-            stats = {
-                "minPrice": min_price,
-                "maxPrice": max_price,
-                "currency": "USD",
-                "totalListings": len(listings)
-            }
+                
+                logger.info(f"✅ Producto encontrado: {formatted_data['name']}")
+                
+                return {
+                    "status": "success",
+                    "data": formatted_data
+                }
+            else:
+                logger.warning(f"⚠️ Algopix: No products found for {upc or search_term}")
+                return {
+                    "status": "error",
+                    "message": "Producto no encontrado en Algopix",
+                    "found": False
+                }
         else:
-            stats = {
-                "minPrice": None,
-                "maxPrice": None,
-                "currency": "USD",
-                "totalListings": 0
+            logger.error(f"❌ Algopix error: {data}")
+            return {
+                "status": "error",
+                "message": data.get("message", "Error desconocido de Algopix"),
+                "algopix_response": data
             }
-        
-        return jsonify({
-            "found": True,
-            "upc": upc,
-            "product": product_info,
-            "listings": len(listings),
-            "stats": stats,
-            "items": listings
-        }), 200
-        
-    except Exception as e:
-        app.logger.error(f"UPC search error: {str(e)}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/test-token', methods=['GET'])
-def test_token():
-    """
-    Test endpoint to verify OAuth token generation
-    GET /test-token
-    """
-    try:
-        token = get_oauth_token()
-        if token:
-            return jsonify({
-                "status": "success",
-                "message": "OAuth token obtained",
-                "token_length": len(token)
-            }), 200
-        else:
-            return jsonify({
-                "status": "failed",
-                "message": "Could not obtain OAuth token"
-            }), 500
-    except Exception as e:
-        return jsonify({
-            "status": "error",
-            "message": str(e)
-        }), 500
-
-@app.route('/test-catalog', methods=['GET'])
-def test_catalog():
-    """
-    Test endpoint to verify Catalog API
-    GET /test-catalog?upc=5902959503105
-    """
-    upc = request.args.get('upc', '5902959503105')
     
-    try:
-        data = search_catalog_by_upc(upc)
-        if data:
-            return jsonify({
-                "status": "success",
-                "message": f"Catalog API working",
-                "data": data
-            }), 200
-        else:
-            return jsonify({
-                "status": "failed",
-                "message": "Catalog API returned no data"
-            }), 500
-    except Exception as e:
-        return jsonify({
+    except requests.exceptions.Timeout:
+        logger.error("❌ Timeout en Algopix API")
+        return {
             "status": "error",
-            "message": str(e)
-        }), 500
+            "message": "Timeout al conectar con Algopix"
+        }
+    
+    except Exception as e:
+        logger.error(f"❌ Error en _call_algopix: {str(e)}")
+        return {
+            "status": "error",
+            "message": f"Error: {str(e)}"
+        }
+
+
+def _calculate_margin(ebay_price, suggested_price):
+    """Calcula el margen de ganancia sugerido"""
+    
+    if not ebay_price or ebay_price == 0:
+        return "No disponible"
+    
+    # Costos típicos en eBay (~20% de fees + impuestos)
+    ebay_fees = ebay_price * 0.20
+    
+    if suggested_price > ebay_price:
+        margin = suggested_price - ebay_price - ebay_fees
+        return f"Vende a ${suggested_price:.2f} (ganancia ${margin:.2f})"
+    else:
+        return f"Precio eBay: ${ebay_price:.2f}"
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# EJECUCIÓN
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=8000, debug=False)
+    port = int(os.environ.get('PORT', 5000))
+    logger.info(f"🚀 Iniciando Savvy Scanner Backend con Algopix API")
+    logger.info(f"   Port: {port}")
+    logger.info(f"   Algopix App ID: {ALGOPIX_APP_ID[:10]}...")
+    logger.info(f"   Quota: 5,000 lookups/mes")
+    app.run(host='0.0.0.0', port=port, debug=False)
