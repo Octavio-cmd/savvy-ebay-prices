@@ -26,7 +26,7 @@ CORS(app)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 ALGOPIX_APP_ID = "2pTW5BzPQdYishB6AiRMNE"
-ALGOPIX_API_KEY = "2xdVJ17VPIinxRhMpg87Mm7I8ucYh7jnp6VGVc9u"
+ALGOPIX_API_KEY = "2xdVJ17VPiinxRhMpg87Mm7l8ucYh7jnp6VGVc9u"
 ALGOPIX_API_URL = "https://api.algopix.ai/v3/search"
 
 # Headers para Algopix
