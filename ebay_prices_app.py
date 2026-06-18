@@ -1,10 +1,10 @@
 """
-SAVVY SCANNER - Backend con ALGOPIX API
-Reemplaza la búsqueda de eBay Catalog API con Algopix Product Analysis API
+SAVVY SCANNER - Backend con ALGOPIX API (ENDPOINT CORRECTO)
+Usa la API v3/search correcta de Algopix
 Optimizado para 5,000 lookups/mes
 
 Instalación de dependencias:
-pip install flask requests python-dotenv
+pip install flask requests python-dotenv flask-cors
 """
 
 from flask import Flask, request, jsonify
@@ -28,12 +28,12 @@ CORS(app)
 
 ALGOPIX_APP_ID = "2pTW5BzPQdYishB6AiRMNE"
 ALGOPIX_API_KEY = "2xdVJ17VPIinxRhMpg87Mm7I8ucYh7jnp6VGVc9u"
-ALGOPIX_API_URL = "https://api.algopix.com/v1"
+ALGOPIX_API_URL = "https://api.algopix.ai/v3/search"
 
-# Headers para Algopix
+# Headers para Algopix (CORRECTO)
 ALGOPIX_HEADERS = {
-    "app-id": ALGOPIX_APP_ID,
-    "app-key": ALGOPIX_API_KEY,
+    "X-API-KEY": ALGOPIX_API_KEY,
+    "X-APP-ID": ALGOPIX_APP_ID,
     "Content-Type": "application/json"
 }
 
@@ -67,7 +67,7 @@ def health():
 @app.route('/search-upc', methods=['GET'])
 def search_upc():
     """
-    Búsqueda por UPC usando Algopix API
+    Búsqueda por UPC usando Algopix API v3/search
     
     Parámetros:
     - upc: Código UPC a buscar (ej: 886227362638)
@@ -105,8 +105,8 @@ def search_upc():
     logger.info(f"🔍 Buscando en Algopix: {upc or search_term}")
     
     try:
-        # Llamar a Algopix Product Analysis API
-        response = _call_algopix_product_analysis(upc, search_term)
+        # Llamar a Algopix API v3/search
+        response = _call_algopix_search(upc or search_term)
         
         if response.get("status") == "success":
             # Guardar en caché para futuras búsquedas
@@ -148,7 +148,7 @@ def test_algopix():
         # UPC de prueba (Nike shoes - product común)
         test_upc = "886227362638"
         
-        response = _call_algopix_product_analysis(test_upc, None)
+        response = _call_algopix_search(test_upc)
         
         return jsonify({
             "test_upc": test_upc,
@@ -188,9 +188,9 @@ def quota():
 # FUNCIONES AUXILIARES - ALGOPIX
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-def _call_algopix_product_analysis(upc, search_term):
+def _call_algopix_search(keywords):
     """
-    Llama a Algopix Product Analysis API
+    Llama a Algopix v3/search API
     
     Retorna:
     {
@@ -211,28 +211,21 @@ def _call_algopix_product_analysis(upc, search_term):
     """
     
     try:
-        # Construir parámetros para Algopix
-        payload = {
-            "marketplaces": ["amazon_us", "ebay_us", "walmart_us"],
-            "country_id": "US",
-            "currency": "USD"
+        # Parámetros para Algopix v3/search
+        params = {
+            "keywords": keywords,
+            "idType": "UPC",
+            "markets": "AMAZON_US,EBAY_US,WALMART_US"
         }
         
-        # Usar UPC o search_term
-        if upc:
-            payload["gtin"] = upc
-        else:
-            payload["search_term"] = search_term
+        logger.info(f"📡 Llamando a Algopix v3/search")
+        logger.info(f"   Keywords: {keywords}")
+        logger.info(f"   Headers: X-API-KEY y X-APP-ID configurados")
         
-        # Llamar a Algopix Product Analysis API
-        url = f"{ALGOPIX_API_URL}/products/search"
-        
-        logger.info(f"📡 Llamando a Algopix: {url}")
-        logger.info(f"   Payload: {payload}")
-        
-        response = requests.post(
-            url,
-            json=payload,
+        # Llamar a Algopix v3/search API (GET request)
+        response = requests.get(
+            ALGOPIX_API_URL,
+            params=params,
             headers=ALGOPIX_HEADERS,
             timeout=10
         )
@@ -242,38 +235,52 @@ def _call_algopix_product_analysis(upc, search_term):
         # Parsear respuesta
         data = response.json()
         
-        if response.status_code == 200 and data.get("status") == "success":
-            # Extraer datos del producto
-            products = data.get("data", [])
+        logger.info(f"📦 Respuesta: {json.dumps(data, indent=2)[:500]}...")  # Log primeros 500 chars
+        
+        if response.status_code == 200 and data.get("status") == "SUCCESS":
+            # Extraer datos del producto del resultado
+            result = data.get("result", {})
             
-            if products:
-                product = products[0]  # Primer resultado
+            if result:
+                # Obtener precios de ofertas
+                offers = result.get("offers", {})
+                
+                # Extraer precios por marketplace
+                ebay_price = _extract_price(offers, "EBAY_US")
+                amazon_price = _extract_price(offers, "AMAZON_US")
+                walmart_price = _extract_price(offers, "WALMART_US")
+                
+                # Obtener demanda
+                demand_level = result.get("demandLevel", {}).get("demandCode", "UNKNOWN")
+                
+                # Contar sellers
+                sellers_count = result.get("sellers", {}).get("sellerCount", 0)
+                
+                # Calcular margen sugerido (usar eBay como base)
+                suggested_price = ebay_price * 1.15 if ebay_price > 0 else 0  # 15% markup
+                margin_text = _calculate_margin(ebay_price, suggested_price)
                 
                 # Formatear respuesta
                 formatted_data = {
-                    "upc": upc or search_term,
-                    "name": product.get("product_name", "Unknown"),
-                    "brand": product.get("brand", ""),
-                    "category": product.get("category", ""),
-                    "image_url": product.get("image_url", ""),
+                    "upc": keywords,
+                    "name": result.get("product", {}).get("name", "Unknown"),
+                    "brand": result.get("product", {}).get("brand", ""),
+                    "category": result.get("product", {}).get("category", ""),
                     
                     # PRECIOS (marketplace específicos)
-                    "ebay_price": product.get("ebay_price", 0),
-                    "amazon_price": product.get("amazon_price", 0),
-                    "walmart_price": product.get("walmart_price", 0),
+                    "ebay_price": ebay_price,
+                    "amazon_price": amazon_price,
+                    "walmart_price": walmart_price,
                     
                     # DEMANDA Y COMPETENCIA
-                    "demand_level": product.get("demand_level", "UNKNOWN"),
-                    "competition_level": product.get("competition_level", "UNKNOWN"),
-                    "sellers_count": product.get("sellers_count", 0),
-                    "sales_rank": product.get("sales_rank", ""),
+                    "demand_level": _parse_demand_level(demand_level),
+                    "competition_level": result.get("competitionLevel", {}).get("competitionCode", "UNKNOWN"),
+                    "sellers_count": sellers_count,
                     
                     # MARGEN SUGERIDO
-                    "suggested_price": product.get("suggested_price", 0),
-                    "margin": _calculate_margin(
-                        product.get("ebay_price", 0),
-                        product.get("suggested_price", 0)
-                    ),
+                    "suggested_price": round(suggested_price, 2),
+                    "margin_suggestion": margin_text,
+                    "margin": margin_text,
                     
                     # INFORMACIÓN ADICIONAL
                     "found": True,
@@ -287,7 +294,7 @@ def _call_algopix_product_analysis(upc, search_term):
                     "data": formatted_data
                 }
             else:
-                logger.warning(f"⚠️ Algopix: No products found for {upc or search_term}")
+                logger.warning(f"⚠️ Algopix: No products found for {keywords}")
                 return {
                     "status": "error",
                     "message": "Producto no encontrado en Algopix",
@@ -297,7 +304,7 @@ def _call_algopix_product_analysis(upc, search_term):
             logger.error(f"❌ Algopix error: {data}")
             return {
                 "status": "error",
-                "message": data.get("message", "Error desconocido de Algopix"),
+                "message": data.get("statusMessage", "Error desconocido de Algopix"),
                 "algopix_response": data
             }
     
@@ -309,11 +316,32 @@ def _call_algopix_product_analysis(upc, search_term):
         }
     
     except Exception as e:
-        logger.error(f"❌ Error en _call_algopix: {str(e)}")
+        logger.error(f"❌ Error en _call_algopix_search: {str(e)}")
         return {
             "status": "error",
             "message": f"Error: {str(e)}"
         }
+
+
+def _extract_price(offers, marketplace):
+    """Extrae el precio de un marketplace específico"""
+    try:
+        market_offers = offers.get(marketplace, {})
+        if market_offers and len(market_offers) > 0:
+            return float(market_offers[0].get("price", 0))
+        return 0
+    except:
+        return 0
+
+
+def _parse_demand_level(code):
+    """Convierte código de demanda a texto legible"""
+    demand_map = {
+        "HIGH": "HIGH",
+        "MEDIUM": "MEDIUM",
+        "LOW": "LOW"
+    }
+    return demand_map.get(code, code)
 
 
 def _calculate_margin(ebay_price, suggested_price):
@@ -338,8 +366,9 @@ def _calculate_margin(ebay_price, suggested_price):
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    logger.info(f"🚀 Iniciando Savvy Scanner Backend con Algopix API")
+    logger.info(f"🚀 Iniciando Savvy Scanner Backend con Algopix API v3/search")
     logger.info(f"   Port: {port}")
     logger.info(f"   Algopix App ID: {ALGOPIX_APP_ID[:10]}...")
+    logger.info(f"   Endpoint: https://api.algopix.ai/v3/search")
     logger.info(f"   Quota: 5,000 lookups/mes")
     app.run(host='0.0.0.0', port=port, debug=False)
