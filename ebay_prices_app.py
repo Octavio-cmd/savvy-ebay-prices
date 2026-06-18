@@ -1,9 +1,11 @@
 import os
 import requests
 import json
+import base64
 from flask import Flask, jsonify, request
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+import time
 
 app = Flask(__name__)
 
@@ -12,22 +14,111 @@ EBAY_APP_ID = os.environ.get('EBAY_APP_ID')
 EBAY_DEV_ID = os.environ.get('EBAY_DEV_ID')
 EBAY_CERT_ID = os.environ.get('EBAY_CERT_ID')
 
-EBAY_FINDING_URL = "https://svcs.ebay.com/services/search/FindingService/v1"
+# eBay OAuth and Browse API endpoints
+EBAY_OAUTH_URL = "https://api.ebay.com/identity/v1/oauth2/token"
+EBAY_BROWSE_URL = "https://api.ebay.com/buy/browse/v1/item_summary/search"
 
-# Configure requests session with retries and longer timeout
+# Global token cache
+_token_cache = {"token": None, "expires_at": 0}
+
 def get_requests_session():
+    """Configure requests session with retries and longer timeout"""
     session = requests.Session()
     retry = Retry(
-        total=1,
-        read=1,
-        connect=1,
-        backoff_factor=0.3,
+        total=2,
+        read=2,
+        connect=2,
+        backoff_factor=0.5,
         status_forcelist=[500, 502, 503, 504]
     )
     adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
     session.mount('http://', adapter)
     session.mount('https://', adapter)
     return session
+
+def get_oauth_token():
+    """
+    Get OAuth token from eBay using Client Credentials flow
+    Uses App ID (Client ID) and Cert ID (Client Secret)
+    """
+    global _token_cache
+    
+    # Return cached token if still valid
+    if _token_cache["token"] and time.time() < _token_cache["expires_at"]:
+        return _token_cache["token"]
+    
+    if not all([EBAY_APP_ID, EBAY_CERT_ID]):
+        app.logger.error("Missing eBay credentials for OAuth")
+        return None
+    
+    try:
+        # Encode credentials
+        credentials = f"{EBAY_APP_ID}:{EBAY_CERT_ID}"
+        credentials_b64 = base64.b64encode(credentials.encode()).decode()
+        
+        headers = {
+            "Authorization": f"Basic {credentials_b64}",
+            "Content-Type": "application/x-www-form-urlencoded"
+        }
+        
+        data = {
+            "grant_type": "client_credentials",
+            "scope": "https://api.ebay.com/oauth/api_scope"
+        }
+        
+        session = get_requests_session()
+        response = session.post(EBAY_OAUTH_URL, headers=headers, data=data, timeout=30)
+        response.raise_for_status()
+        
+        token_data = response.json()
+        token = token_data.get('access_token')
+        expires_in = token_data.get('expires_in', 3600)
+        
+        if token:
+            # Cache token (expires in 1 hour, refresh at 55 minutes)
+            _token_cache["token"] = token
+            _token_cache["expires_at"] = time.time() + (expires_in - 300)
+            app.logger.info("OAuth token obtained successfully")
+            return token
+        else:
+            app.logger.error("No access_token in eBay response")
+            return None
+            
+    except requests.exceptions.RequestException as e:
+        app.logger.error(f"OAuth token request failed: {str(e)}")
+        return None
+
+def search_browse_api(keywords):
+    """
+    Search eBay using Browse API
+    Returns filtered results with price, title, itemId
+    """
+    token = get_oauth_token()
+    if not token:
+        return None
+    
+    try:
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json"
+        }
+        
+        params = {
+            "q": keywords,
+            "limit": 50,
+            "sort": "price"
+        }
+        
+        session = get_requests_session()
+        response = session.get(EBAY_BROWSE_URL, headers=headers, params=params, timeout=60)
+        response.raise_for_status()
+        
+        data = response.json()
+        return data
+        
+    except requests.exceptions.RequestException as e:
+        app.logger.error(f"Browse API request failed: {str(e)}")
+        return None
 
 @app.route('/health', methods=['GET'])
 def health():
@@ -37,7 +128,7 @@ def health():
 def search_ebay():
     """
     GET /search?q=keyword&size=XL
-    Returns: {found, query, listings, stats, suggested}
+    Returns: {found, query, listings, stats}
     """
     query = request.args.get('q', '')
     size = request.args.get('size', '')
@@ -45,269 +136,181 @@ def search_ebay():
     if not query:
         return jsonify({"error": "Missing 'q' parameter"}), 400
     
-    # Append size to query if provided
     search_query = f"{query} {size}".strip()
     
-    if not all([EBAY_APP_ID, EBAY_DEV_ID, EBAY_CERT_ID]):
-        return jsonify({"error": "Missing eBay credentials in environment"}), 500
-    
     try:
-        # eBay Finding API request
-        params = {
-            'OPERATION-NAME': 'findItemsByKeywords',
-            'SERVICE-VERSION': '1.0.0',
-            'SECURITY-APPNAME': EBAY_APP_ID,
-            'GLOBAL-ID': 'EBAY-US',
-            'RESPONSE-DATA-FORMAT': 'JSON',
-            'REST-PAYLOAD': 'true',
-            'keywords': search_query,
-            'paginationInput.entriesPerPage': '100'
-        }
+        data = search_browse_api(search_query)
         
-        session = get_requests_session()
-        # TIMEOUT INCREASED TO 60 SECONDS
-        response = session.get(EBAY_FINDING_URL, params=params, timeout=60)
-        response.raise_for_status()
+        if not data:
+            return jsonify({
+                "found": False,
+                "query": search_query,
+                "listings": 0,
+                "error": "eBay API returned no data"
+            }), 503
         
-        data = response.json()
-        
-        # VALIDATE: Check if eBay returned an error
-        if 'errorMessage' in data:
-            error_msg = data.get('errorMessage', [{}])[0].get('error', [{}])[0].get('message', 'Unknown eBay error')
-            app.logger.error(f"eBay API error: {error_msg}")
-            return jsonify({"error": f"eBay returned error: {error_msg}"}), 400
-        
-        # Extract findItemsByKeywordsResponse
-        response_list = data.get('findItemsByKeywordsResponse', [])
-        if not response_list or len(response_list) == 0:
-            app.logger.error("No findItemsByKeywordsResponse in eBay data")
-            return jsonify({"error": "Invalid eBay response format"}), 500
-        
-        results = response_list[0]
-        search_result = results.get('searchResult', [])
-        
-        if not search_result or len(search_result) == 0:
-            items = []
-        else:
-            items = search_result[0].get('item', [])
+        items = data.get('itemSummaries', [])
         
         if not items:
             return jsonify({
                 "found": False,
                 "query": search_query,
-                "listings": 0,
-                "stats": {
-                    "minPrice": None,
-                    "avgPrice": None,
-                    "maxPrice": None,
-                    "totalListings": 0
-                },
-                "suggested": {
-                    "price": None,
-                    "margin": None
-                }
+                "listings": 0
             }), 200
         
-        # Extract prices
-        prices = []
-        for item in items:
+        # Extract and sort by price
+        listings = []
+        for item in items[:10]:  # Top 10
             try:
-                selling_status = item.get('sellingStatus', [{}])
-                if selling_status and len(selling_status) > 0:
-                    current_price = selling_status[0].get('convertedCurrentPrice', [{}])
-                    if current_price and len(current_price) > 0:
-                        price_str = current_price[0].get('__value__', '0')
-                        price = float(price_str)
-                        if price > 0:
-                            prices.append(price)
-            except (ValueError, TypeError, IndexError, KeyError):
-                pass
+                price_obj = item.get('price', {})
+                price_value = price_obj.get('value') if isinstance(price_obj, dict) else None
+                
+                listing = {
+                    "id": item.get('itemId'),
+                    "title": item.get('title', 'N/A'),
+                    "price": float(price_value) if price_value else None,
+                    "url": item.get('itemWebUrl', ''),
+                    "image": item.get('image', {}).get('imageUrl', '')
+                }
+                listings.append(listing)
+            except Exception as e:
+                app.logger.warning(f"Error parsing item: {str(e)}")
+                continue
         
-        if prices:
-            min_price = min(prices)
-            max_price = max(prices)
-            avg_price = sum(prices) / len(prices)
-            
-            # Suggested price = avg * 0.75 (25% margin)
-            suggested_price = round(avg_price * 0.75, 2)
-        else:
-            min_price = avg_price = max_price = suggested_price = None
+        # Sort by price
+        listings.sort(key=lambda x: x['price'] if x['price'] else float('inf'))
+        
+        if not listings:
+            return jsonify({
+                "found": False,
+                "query": search_query,
+                "listings": 0
+            }), 200
+        
+        min_price = listings[0]['price']
+        max_price = listings[-1]['price']
+        avg_price = sum(l['price'] for l in listings if l['price']) / len([l for l in listings if l['price']]) if listings else 0
         
         return jsonify({
             "found": True,
             "query": search_query,
-            "listings": len(items),
+            "listings": len(listings),
             "stats": {
-                "minPrice": round(min_price, 2) if min_price else None,
-                "avgPrice": round(avg_price, 2) if avg_price else None,
-                "maxPrice": round(max_price, 2) if max_price else None,
-                "totalListings": len(items)
+                "minPrice": min_price,
+                "maxPrice": max_price,
+                "avgPrice": round(avg_price, 2)
             },
-            "suggested": {
-                "price": suggested_price,
-                "margin": "25%"
-            }
+            "items": listings
         }), 200
-    
-    except requests.exceptions.Timeout:
-        app.logger.error("eBay API timeout on /search - took longer than 60 seconds")
-        return jsonify({"error": "eBay API timeout - request took too long"}), 504
-    except requests.exceptions.ConnectionError as e:
-        app.logger.error(f"eBay connection error on /search: {str(e)}")
-        return jsonify({"error": f"Cannot connect to eBay: {str(e)}"}), 503
-    except requests.RequestException as e:
-        app.logger.error(f"eBay request error on /search: {str(e)}")
-        return jsonify({"error": f"eBay API error: {str(e)}"}), 500
+        
     except Exception as e:
-        app.logger.error(f"Unexpected error in /search: {str(e)}")
-        return jsonify({"error": f"Server error: {str(e)}"}), 500
-
+        app.logger.error(f"Search error: {str(e)}")
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/search-upc', methods=['GET'])
 def search_upc():
     """
     GET /search-upc?upc=071214003222
-    Returns: {found, upc, product, stats, suggested}
+    Returns: {found, upc, listings, stats}
     """
     upc = request.args.get('upc', '')
     
     if not upc:
         return jsonify({"error": "Missing 'upc' parameter"}), 400
     
-    if not all([EBAY_APP_ID, EBAY_DEV_ID, EBAY_CERT_ID]):
-        return jsonify({"error": "Missing eBay credentials in environment"}), 500
-    
     try:
-        # eBay Finding API request - search by UPC
-        params = {
-            'OPERATION-NAME': 'findItemsByKeywords',
-            'SERVICE-VERSION': '1.0.0',
-            'SECURITY-APPNAME': EBAY_APP_ID,
-            'GLOBAL-ID': 'EBAY-US',
-            'RESPONSE-DATA-FORMAT': 'JSON',
-            'REST-PAYLOAD': 'true',
-            'keywords': upc,
-            'paginationInput.entriesPerPage': '20'
-        }
+        # Search by UPC
+        data = search_browse_api(upc)
         
-        session = get_requests_session()
-        # TIMEOUT INCREASED TO 60 SECONDS
-        response = session.get(EBAY_FINDING_URL, params=params, timeout=60)
-        response.raise_for_status()
+        if not data:
+            return jsonify({
+                "found": False,
+                "upc": upc,
+                "listings": 0,
+                "error": "eBay API returned no data"
+            }), 503
         
-        data = response.json()
-        
-        # VALIDATE: Check if eBay returned an error
-        if 'errorMessage' in data:
-            error_msg = data.get('errorMessage', [{}])[0].get('error', [{}])[0].get('message', 'Unknown eBay error')
-            app.logger.error(f"eBay API error on UPC search: {error_msg}")
-            return jsonify({"error": f"eBay returned error: {error_msg}"}), 400
-        
-        # Extract items safely
-        response_list = data.get('findItemsByKeywordsResponse', [])
-        if not response_list or len(response_list) == 0:
-            app.logger.error("No findItemsByKeywordsResponse in eBay data")
-            return jsonify({"error": "Invalid eBay response format"}), 500
-        
-        results = response_list[0]
-        search_result = results.get('searchResult', [])
-        
-        if not search_result or len(search_result) == 0:
-            items = []
-        else:
-            items = search_result[0].get('item', [])
+        items = data.get('itemSummaries', [])
         
         if not items:
             return jsonify({
                 "found": False,
                 "upc": upc,
-                "product": None,
-                "stats": None,
-                "suggested": None
+                "listings": 0
             }), 200
         
-        # Get first item (most relevant)
-        item = items[0]
-        
-        # Extract product info safely
-        title = item.get('title', ['Unknown'])[0] if item.get('title') else 'Unknown'
-        
-        selling_status = item.get('sellingStatus', [{}])
-        price_str = '0'
-        if selling_status and len(selling_status) > 0:
-            current_price = selling_status[0].get('convertedCurrentPrice', [{}])
-            if current_price and len(current_price) > 0:
-                price_str = current_price[0].get('__value__', '0')
-        
-        seller_info = item.get('sellerInfo', [{}])
-        seller = 'Unknown'
-        if seller_info and len(seller_info) > 0:
-            seller_name = seller_info[0].get('sellerUserName', ['Unknown'])
-            seller = seller_name[0] if seller_name else 'Unknown'
-        
-        condition = item.get('condition', ['Unknown'])[0] if item.get('condition') else 'Unknown'
-        
-        try:
-            price = float(price_str)
-        except (ValueError, TypeError):
-            price = 0
-        
-        # Extract all prices for stats
-        prices = []
-        for i in items[:10]:  # Get top 10 items
+        # Extract and sort by price
+        listings = []
+        for item in items[:10]:  # Top 10
             try:
-                selling_status = i.get('sellingStatus', [{}])
-                if selling_status and len(selling_status) > 0:
-                    current_price = selling_status[0].get('convertedCurrentPrice', [{}])
-                    if current_price and len(current_price) > 0:
-                        p = float(current_price[0].get('__value__', '0'))
-                        if p > 0:
-                            prices.append(p)
-            except (ValueError, TypeError, IndexError, KeyError):
-                pass
+                price_obj = item.get('price', {})
+                price_value = price_obj.get('value') if isinstance(price_obj, dict) else None
+                
+                listing = {
+                    "id": item.get('itemId'),
+                    "title": item.get('title', 'N/A'),
+                    "price": float(price_value) if price_value else None,
+                    "url": item.get('itemWebUrl', ''),
+                    "image": item.get('image', {}).get('imageUrl', '')
+                }
+                listings.append(listing)
+            except Exception as e:
+                app.logger.warning(f"Error parsing item: {str(e)}")
+                continue
         
-        if prices:
-            min_price = min(prices)
-            avg_price = sum(prices) / len(prices)
-            max_price = max(prices)
-            suggested_price = round(avg_price * 0.75, 2)
-        else:
-            min_price = avg_price = max_price = suggested_price = None
+        # Sort by price
+        listings.sort(key=lambda x: x['price'] if x['price'] else float('inf'))
+        
+        if not listings:
+            return jsonify({
+                "found": False,
+                "upc": upc,
+                "listings": 0
+            }), 200
+        
+        min_price = listings[0]['price']
+        max_price = listings[-1]['price']
         
         return jsonify({
             "found": True,
             "upc": upc,
-            "product": {
-                "title": title,
-                "price": price,
-                "seller": seller,
-                "condition": condition
-            },
+            "listings": len(listings),
             "stats": {
-                "minPrice": round(min_price, 2) if min_price else None,
-                "avgPrice": round(avg_price, 2) if avg_price else None,
-                "maxPrice": round(max_price, 2) if max_price else None,
-                "totalListings": len(items)
+                "minPrice": min_price,
+                "maxPrice": max_price,
+                "currency": "USD"
             },
-            "suggested": {
-                "price": suggested_price,
-                "margin": "25%"
-            }
+            "items": listings
         }), 200
-    
-    except requests.exceptions.Timeout:
-        app.logger.error("eBay API timeout on /search-upc - took longer than 60 seconds")
-        return jsonify({"error": "eBay API timeout - request took too long"}), 504
-    except requests.exceptions.ConnectionError as e:
-        app.logger.error(f"eBay connection error on /search-upc: {str(e)}")
-        return jsonify({"error": f"Cannot connect to eBay: {str(e)}"}), 503
-    except requests.RequestException as e:
-        app.logger.error(f"eBay request error on /search-upc: {str(e)}")
-        return jsonify({"error": f"eBay API error: {str(e)}"}), 500
+        
     except Exception as e:
-        app.logger.error(f"Unexpected error in /search-upc: {str(e)}")
-        return jsonify({"error": f"Server error: {str(e)}"}), 500
+        app.logger.error(f"UPC search error: {str(e)}")
+        return jsonify({"error": str(e)}), 500
 
+@app.route('/test-token', methods=['GET'])
+def test_token():
+    """
+    Test endpoint to verify OAuth token generation
+    GET /test-token
+    """
+    try:
+        token = get_oauth_token()
+        if token:
+            return jsonify({
+                "status": "success",
+                "message": "OAuth token obtained",
+                "token_length": len(token)
+            }), 200
+        else:
+            return jsonify({
+                "status": "failed",
+                "message": "Could not obtain OAuth token"
+            }), 500
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "message": str(e)
+        }), 500
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
+    app.run(host='0.0.0.0', port=8000, debug=False)
