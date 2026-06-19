@@ -425,10 +425,37 @@ def ebay_item():
                 brand = aspect.get("value", "")
                 break
 
+        # ── Extraer costo de envío ────────────────────────────
+        shipping_cost = 0.0
+        shipping_type = "calculated"
+        shipping_options = item.get("shippingOptions", [])
+        if shipping_options:
+            first = shipping_options[0]
+            ship_cost_obj = first.get("shippingCost", {})
+            if ship_cost_obj:
+                shipping_cost = float(ship_cost_obj.get("value", 0))
+                shipping_type = "paid"
+            else:
+                # Si no hay costo → envío gratis
+                shipping_cost = 0.0
+                shipping_type = "free"
+        # También verificar si el item tiene "freeShipping" flag
+        if item.get("shippingOptions") and any(
+            float(o.get("shippingCost", {}).get("value", 1)) == 0
+            for o in item.get("shippingOptions", [])
+        ):
+            shipping_cost = 0.0
+            shipping_type = "free"
+
+        total_price = round(price + shipping_cost, 2)
+
         formatted = {
             "item_id": item_id,
             "title": item.get("title", ""),
             "price": round(price, 2),
+            "shipping_cost": round(shipping_cost, 2),
+            "shipping_type": shipping_type,
+            "total_price": total_price,
             "currency": price_obj.get("currency", "USD"),
             "condition": item.get("condition", ""),
             "seller": item.get("seller", {}).get("username", ""),
@@ -440,7 +467,7 @@ def ebay_item():
             "timestamp": datetime.now().isoformat()
         }
 
-        logger.info(f"✅ eBay item encontrado: {formatted['title'][:60]}")
+        logger.info(f"✅ eBay item: {formatted['title'][:50]} | item=${price} ship=${shipping_cost} total=${total_price}")
         CACHE[cache_key] = formatted
         return jsonify({"data": formatted, "status": "success", "cached": False})
 
