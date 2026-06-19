@@ -297,6 +297,159 @@ def _calculate_margin(ebay_price, suggested_price):
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# EBAY BROWSE API
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+EBAY_CLIENT_ID     = "StevenGa-SavvySca-PRD-81addb012-655f2649"
+EBAY_CLIENT_SECRET = "PRD-1addb012c112-1d46-4c31-9731-99d5"
+EBAY_TOKEN_URL     = "https://api.ebay.com/identity/v1/oauth2/token"
+EBAY_BROWSE_URL    = "https://api.ebay.com/buy/browse/v1/item/"
+
+_ebay_token_cache = {"token": None, "expires_at": 0}
+
+def _get_ebay_token():
+    import base64, time
+    now = time.time()
+    if _ebay_token_cache["token"] and now < _ebay_token_cache["expires_at"] - 60:
+        return _ebay_token_cache["token"]
+    credentials = base64.b64encode(f"{EBAY_CLIENT_ID}:{EBAY_CLIENT_SECRET}".encode()).decode()
+    headers = {"Authorization": f"Basic {credentials}", "Content-Type": "application/x-www-form-urlencoded"}
+    data = "grant_type=client_credentials&scope=https%3A%2F%2Fapi.ebay.com%2Foauth%2Fapi_scope"
+    resp = requests.post(EBAY_TOKEN_URL, headers=headers, data=data, timeout=10)
+    if resp.status_code != 200:
+        logger.error(f"❌ eBay token error {resp.status_code}: {resp.text}")
+        return None
+    token_data = resp.json()
+    _ebay_token_cache["token"] = token_data.get("access_token")
+    _ebay_token_cache["expires_at"] = now + token_data.get("expires_in", 7200)
+    logger.info("✅ eBay token obtenido")
+    return _ebay_token_cache["token"]
+
+
+@app.route('/resolve-url', methods=['GET'])
+def resolve_url():
+    """
+    Resuelve un URL corto de eBay (ebay.io/m/...) y extrae el Item ID.
+    La app de eBay en iPhone siempre genera links cortos — este endpoint los resuelve.
+    Parámetros:
+    - url: URL corto de eBay
+    """
+    import re
+    short_url = request.args.get('url', '').strip()
+    if not short_url:
+        return jsonify({"error": "Debe proporcionar url", "status": "error"}), 400
+
+    logger.info(f"🔗 Resolviendo URL: {short_url}")
+
+    try:
+        resp = requests.get(
+            short_url,
+            allow_redirects=True,
+            timeout=8,
+            headers={"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15"}
+        )
+        final_url = resp.url
+        logger.info(f"✅ URL resuelto: {final_url}")
+
+        item_id = None
+        patterns = [
+            r'/itm/(?:[^/?]+/)?(\d{10,13})',
+            r'[?&]item=(\d{10,13})',
+            r'[?&]itemId=(\d{10,13})',
+            r'/(\d{12,13})(?:[/?]|$)',
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, final_url)
+            if match:
+                item_id = match.group(1)
+                break
+
+        if not item_id:
+            return jsonify({"status": "error", "error": "No se encontró Item ID", "final_url": final_url}), 404
+
+        return jsonify({"status": "success", "item_id": item_id, "final_url": final_url})
+
+    except Exception as e:
+        logger.error(f"❌ resolve_url error: {str(e)}")
+        return jsonify({"error": str(e), "status": "error"}), 500
+
+
+@app.route('/ebay-item', methods=['GET'])
+def ebay_item():
+    """
+    Busca un item de eBay por su Item ID (extraído del URL).
+    Parámetros:
+    - item_id: eBay Item ID (ej: 387234567890)
+    """
+    item_id = request.args.get('item_id', '').strip()
+    if not item_id:
+        return jsonify({"error": "Debe proporcionar item_id", "status": "error"}), 400
+
+    item_id = ''.join(filter(str.isdigit, item_id))
+    if not item_id:
+        return jsonify({"error": "item_id inválido", "status": "error"}), 400
+
+    cache_key = f"ebay_item_{item_id}"
+    if cache_key in CACHE:
+        return jsonify({"data": CACHE[cache_key], "cached": True, "status": "success"})
+
+    logger.info(f"🛒 Buscando eBay item: {item_id}")
+
+    try:
+        token = _get_ebay_token()
+        if not token:
+            return jsonify({"error": "No se pudo obtener token de eBay", "status": "error"}), 500
+
+        headers = {"Authorization": f"Bearer {token}", "X-EBAY-C-MARKETPLACE-ID": "EBAY_US"}
+        url = f"{EBAY_BROWSE_URL}v1|{item_id}|0"
+        logger.info(f"📡 GET {url}")
+
+        resp = requests.get(url, headers=headers, timeout=10)
+        logger.info(f"📬 eBay status: {resp.status_code}")
+
+        if resp.status_code != 200:
+            return jsonify({"error": f"eBay error {resp.status_code}", "status": "error"}), resp.status_code
+
+        item = resp.json()
+        price = 0.0
+        price_obj = item.get("price", {})
+        if price_obj:
+            price = float(price_obj.get("value", 0))
+
+        image_url = item.get("image", {}).get("imageUrl", "")
+        additional_images = [ai.get("imageUrl", "") for ai in item.get("additionalImages", []) if ai.get("imageUrl")]
+
+        brand = ""
+        for aspect in item.get("localizedAspects", []):
+            if aspect.get("name", "").lower() == "brand":
+                brand = aspect.get("value", "")
+                break
+
+        formatted = {
+            "item_id": item_id,
+            "title": item.get("title", ""),
+            "price": round(price, 2),
+            "currency": price_obj.get("currency", "USD"),
+            "condition": item.get("condition", ""),
+            "seller": item.get("seller", {}).get("username", ""),
+            "image_url": image_url,
+            "additional_images": additional_images[:4],
+            "item_url": item.get("itemWebUrl", f"https://www.ebay.com/itm/{item_id}"),
+            "brand": brand,
+            "found": True,
+            "timestamp": datetime.now().isoformat()
+        }
+
+        logger.info(f"✅ eBay item encontrado: {formatted['title'][:60]}")
+        CACHE[cache_key] = formatted
+        return jsonify({"data": formatted, "status": "success", "cached": False})
+
+    except Exception as e:
+        logger.error(f"❌ ebay_item error: {str(e)}")
+        return jsonify({"error": str(e), "status": "error"}), 500
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
