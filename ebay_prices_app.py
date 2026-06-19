@@ -22,12 +22,16 @@ app = Flask(__name__)
 CORS(app)
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# CONFIGURACIÓN DE ALGOPIX
+# CONFIGURACIÓN DE ALGOPIX (DESDE VARIABLES DE ENTORNO)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-ALGOPIX_APP_ID = "2pTW5BzPQdYishB6AiRMNE"
-ALGOPIX_API_KEY = "2xdVJ17VPiinxRhMpg87Mm7l8ucYh7jnp6VGVc9u"
+ALGOPIX_APP_ID = os.environ.get("ALGOPIX_APP_ID", "")
+ALGOPIX_API_KEY = os.environ.get("ALGOPIX_API_KEY", "")
 ALGOPIX_API_URL = "https://api.algopix.ai/v3/search"
+
+# Validación de credenciales
+if not ALGOPIX_APP_ID or not ALGOPIX_API_KEY:
+    logger.warning("⚠️  ALGOPIX_APP_ID o ALGOPIX_API_KEY no configurados en variables de entorno")
 
 # Headers para Algopix
 ALGOPIX_HEADERS = {
@@ -59,7 +63,8 @@ def health():
         "service": "Savvy Scanner - Algopix Backend",
         "timestamp": datetime.now().isoformat(),
         "lookups_today": LOOKUP_COUNT["today"],
-        "lookups_total": LOOKUP_COUNT["total"]
+        "lookups_total": LOOKUP_COUNT["total"],
+        "algopix_configured": bool(ALGOPIX_APP_ID and ALGOPIX_API_KEY)
     })
 
 
@@ -180,6 +185,7 @@ def _call_algopix_search(keywords):
         
         logger.info(f"📡 GET {ALGOPIX_API_URL}")
         logger.info(f"   keywords: {keywords}")
+        logger.info(f"   APP_ID: {ALGOPIX_APP_ID[:10]}..." if ALGOPIX_APP_ID else "   APP_ID: NOT SET")
         
         # GET request
         response = requests.get(
@@ -231,28 +237,28 @@ def _call_algopix_search(keywords):
                     "suggested_price": round(suggested_price, 2),
                     "margin_suggestion": margin_text,
                     
-                    "found": True,
+                    "category": result.get("category", {}).get("name", ""),
+                    "asin": result.get("asin", ""),
+                    "score": result.get("score", 0),
+                    "data_source": "Algopix",
                     "timestamp": datetime.now().isoformat()
                 }
                 
-                logger.info(f"✅ Producto encontrado: {formatted_data['name']}")
-                
+                logger.info(f"✅ Producto encontrado: {formatted_data['name'][:50]}")
                 return {
                     "status": "success",
                     "data": formatted_data
                 }
             else:
-                logger.warning(f"⚠️ No products found for {keywords}")
                 return {
                     "status": "error",
-                    "message": "Producto no encontrado en Algopix",
-                    "found": False
+                    "message": "Algopix no encontró resultados",
+                    "algopix_response": data
                 }
         else:
-            logger.error(f"❌ Algopix error: {data}")
             return {
                 "status": "error",
-                "message": data.get("statusMessage", "Error de Algopix"),
+                "message": f"Algopix error {response.status_code}",
                 "algopix_response": data
             }
     
@@ -484,4 +490,5 @@ if __name__ == '__main__':
     logger.info(f"   Endpoint: {ALGOPIX_API_URL}")
     logger.info(f"   Parámetro: keywords (auto-detecta tipo)")
     logger.info(f"   Quota: 5,000 lookups/mes")
+    logger.info(f"   Algopix CONFIG: APP_ID={'✅' if ALGOPIX_APP_ID else '❌'} | API_KEY={'✅' if ALGOPIX_API_KEY else '❌'}")
     app.run(host='0.0.0.0', port=port, debug=False)
