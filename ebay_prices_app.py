@@ -127,7 +127,77 @@ def search_upc():
         }), 500
 
 
-@app.route('/test-algopix', methods=['GET'])
+@app.route('/test-apis', methods=['GET'])
+def test_apis():
+    """
+    Test cada API individualmente para debug
+    """
+    upc = request.args.get('upc', '071249078761')
+    
+    results = {
+        "upc": upc,
+        "timestamp": datetime.now().isoformat(),
+        "tests": {}
+    }
+    
+    # TEST 1: ALGOPIX
+    try:
+        logger.info(f"🧪 TEST 1: Algopix")
+        response = requests.get(
+            "https://api.algopix.ai/v3/products/matches",
+            params={"keywords": upc},
+            headers={
+                "X-API-KEY": ALGOPIX_API_KEY,
+                "X-APP-ID": ALGOPIX_APP_ID
+            },
+            timeout=5
+        )
+        results["tests"]["algopix"] = {
+            "status": response.status_code,
+            "response": response.text[:200]
+        }
+        logger.info(f"   Status: {response.status_code}")
+    except Exception as e:
+        results["tests"]["algopix"] = {"error": str(e)}
+        logger.error(f"   Error: {str(e)}")
+    
+    # TEST 2: UPCitemdb
+    try:
+        logger.info(f"🧪 TEST 2: UPCitemdb")
+        response = requests.get(
+            f"https://api.upcitemdb.com/prod/trial/lookup?upc={upc}",
+            timeout=5
+        )
+        data = response.json()
+        results["tests"]["upcitemdb"] = {
+            "status": response.status_code,
+            "found": bool(data.get("items")),
+            "response": response.text[:200]
+        }
+        logger.info(f"   Status: {response.status_code} | Found: {bool(data.get('items'))}")
+    except Exception as e:
+        results["tests"]["upcitemdb"] = {"error": str(e)}
+        logger.error(f"   Error: {str(e)}")
+    
+    # TEST 3: OpenFoodFacts
+    try:
+        logger.info(f"🧪 TEST 3: OpenFoodFacts")
+        response = requests.get(
+            f"https://world.openfoodfacts.org/api/v2/product/{upc}.json",
+            timeout=5
+        )
+        data = response.json()
+        results["tests"]["openfoodfacts"] = {
+            "status": response.status_code,
+            "found": data.get("status") == 1,
+            "response": response.text[:200]
+        }
+        logger.info(f"   Status: {response.status_code} | Found: {data.get('status') == 1}")
+    except Exception as e:
+        results["tests"]["openfoodfacts"] = {"error": str(e)}
+        logger.error(f"   Error: {str(e)}")
+    
+    return jsonify(results)
 def test_algopix():
     """Test endpoint"""
     logger.info("🧪 Testing Algopix...")
