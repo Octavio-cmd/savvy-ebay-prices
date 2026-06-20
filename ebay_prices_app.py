@@ -130,7 +130,7 @@ def search_upc():
 @app.route('/test-apis', methods=['GET'])
 def test_apis():
     """
-    Test cada API individualmente para debug
+    Test cada API individualmente para debug - RESPUESTA COMPLETA
     """
     upc = request.args.get('upc', '071249078761')
     
@@ -153,8 +153,8 @@ def test_apis():
             timeout=5
         )
         results["tests"]["algopix"] = {
-            "status": response.status_code,
-            "response": response.text[:200]
+            "status_code": response.status_code,
+            "full_response": response.json() if response.status_code < 500 else response.text
         }
         logger.info(f"   Status: {response.status_code}")
     except Exception as e:
@@ -170,11 +170,11 @@ def test_apis():
         )
         data = response.json()
         results["tests"]["upcitemdb"] = {
-            "status": response.status_code,
-            "found": bool(data.get("items")),
-            "response": response.text[:200]
+            "status_code": response.status_code,
+            "full_response": data,
+            "has_items": bool(data.get("items"))
         }
-        logger.info(f"   Status: {response.status_code} | Found: {bool(data.get('items'))}")
+        logger.info(f"   Status: {response.status_code} | Has items: {bool(data.get('items'))}")
     except Exception as e:
         results["tests"]["upcitemdb"] = {"error": str(e)}
         logger.error(f"   Error: {str(e)}")
@@ -188,11 +188,11 @@ def test_apis():
         )
         data = response.json()
         results["tests"]["openfoodfacts"] = {
-            "status": response.status_code,
-            "found": data.get("status") == 1,
-            "response": response.text[:200]
+            "status_code": response.status_code,
+            "full_response": data,
+            "status": data.get("status")
         }
-        logger.info(f"   Status: {response.status_code} | Found: {data.get('status') == 1}")
+        logger.info(f"   Status: {response.status_code}")
     except Exception as e:
         results["tests"]["openfoodfacts"] = {"error": str(e)}
         logger.error(f"   Error: {str(e)}")
