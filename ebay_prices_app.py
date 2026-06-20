@@ -173,21 +173,17 @@ def quota():
 
 def _call_algopix_search(keywords):
     """
-    Llama a Algopix v3/search con SOLO el parámetro keywords
-    Algopix auto-detecta si es UPC, ASIN, EAN, etc.
+    Intenta Algopix primero. Si falla, usa APIs gratuitas (UPCitemdb, OpenFoodFacts)
     """
     
+    # ══════════════════════════════════════════════════════════════════════════════════
+    # PASO 1: INTENTA ALGOPIX
+    # ══════════════════════════════════════════════════════════════════════════════════
+    
     try:
-        # Parámetros SIMPLIFICADOS - solo keywords
-        params = {
-            "keywords": keywords
-        }
+        params = {"keywords": keywords}
+        logger.info(f"🔍 Intentando Algopix: {keywords}")
         
-        logger.info(f"📡 GET {ALGOPIX_API_URL}")
-        logger.info(f"   keywords: {keywords}")
-        logger.info(f"   APP_ID: {ALGOPIX_APP_ID[:10]}..." if ALGOPIX_APP_ID else "   APP_ID: NOT SET")
-        
-        # GET request
         response = requests.get(
             ALGOPIX_API_URL,
             params=params,
@@ -195,86 +191,130 @@ def _call_algopix_search(keywords):
             timeout=10
         )
         
-        logger.info(f"📬 Status: {response.status_code}")
-        logger.info(f"📦 Response: {response.text[:500]}")
-        
+        logger.info(f"   Status: {response.status_code}")
         data = response.json()
         
         if response.status_code == 200 and data.get("status") == "SUCCESS":
             result = data.get("result", {})
             
             if result:
-                # Extraer precios
+                # Algopix ÉXITO
                 offers = result.get("offers", {})
-                
                 ebay_price = _extract_price(offers, "EBAY_US")
                 amazon_price = _extract_price(offers, "AMAZON_US")
                 walmart_price = _extract_price(offers, "WALMART_US")
-                
-                # Demanda
-                demand_level = result.get("demandLevel", {}).get("demandCode", "UNKNOWN")
-                
-                # Sellers
-                sellers_count = result.get("sellers", {}).get("sellerCount", 0)
-                
-                # Margen
-                suggested_price = ebay_price * 1.15 if ebay_price > 0 else 0
-                margin_text = _calculate_margin(ebay_price, suggested_price)
                 
                 formatted_data = {
                     "upc": keywords,
                     "name": result.get("product", {}).get("name", "Unknown"),
                     "brand": result.get("product", {}).get("brand", ""),
-                    
                     "ebay_price": round(ebay_price, 2),
                     "amazon_price": round(amazon_price, 2),
                     "walmart_price": round(walmart_price, 2),
-                    
-                    "demand_level": demand_level,
-                    "competition_level": result.get("competitionLevel", {}).get("competitionCode", "UNKNOWN"),
-                    "sellers_count": sellers_count,
-                    
-                    "suggested_price": round(suggested_price, 2),
-                    "margin_suggestion": margin_text,
-                    
+                    "demand_level": result.get("demandLevel", {}).get("demandCode", "UNKNOWN"),
+                    "sellers_count": result.get("sellers", {}).get("sellerCount", 0),
+                    "suggested_price": round(ebay_price * 1.15 if ebay_price > 0 else 0, 2),
+                    "margin_suggestion": _calculate_margin(ebay_price, ebay_price * 1.15 if ebay_price > 0 else 0),
                     "category": result.get("category", {}).get("name", ""),
                     "asin": result.get("asin", ""),
                     "score": result.get("score", 0),
-                    "data_source": "Algopix",
+                    "data_source": "Algopix ✅",
                     "timestamp": datetime.now().isoformat()
                 }
                 
-                logger.info(f"✅ Producto encontrado: {formatted_data['name'][:50]}")
-                return {
-                    "status": "success",
-                    "data": formatted_data
-                }
-            else:
-                return {
-                    "status": "error",
-                    "message": "Algopix no encontró resultados",
-                    "algopix_response": data
-                }
-        else:
-            return {
-                "status": "error",
-                "message": f"Algopix error {response.status_code}",
-                "algopix_response": data
-            }
-    
-    except requests.exceptions.Timeout:
-        logger.error("❌ Timeout")
-        return {
-            "status": "error",
-            "message": "Timeout al conectar con Algopix"
-        }
+                logger.info(f"✅ Algopix ÉXITO: {formatted_data['name'][:50]}")
+                return {"status": "success", "data": formatted_data}
     
     except Exception as e:
-        logger.error(f"❌ Error: {str(e)}")
-        return {
-            "status": "error",
-            "message": f"Error: {str(e)}"
-        }
+        logger.warning(f"⚠️  Algopix falló: {str(e)}")
+    
+    # ══════════════════════════════════════════════════════════════════════════════════
+    # PASO 2: FALLBACK A UPCitemdb (GRATUITO)
+    # ══════════════════════════════════════════════════════════════════════════════════
+    
+    try:
+        logger.info(f"🔍 Intentando UPCitemdb: {keywords}")
+        response = requests.get(
+            f"https://api.upcitemdb.com/prod/trial/lookup?upc={keywords}",
+            timeout=8
+        )
+        data = response.json()
+        
+        if data.get("items") and len(data["items"]) > 0:
+            item = data["items"][0]
+            formatted_data = {
+                "upc": keywords,
+                "name": item.get("title") or item.get("description") or "Unknown",
+                "brand": item.get("brand", ""),
+                "ebay_price": 0,
+                "amazon_price": 0,
+                "walmart_price": 0,
+                "demand_level": "UNKNOWN",
+                "sellers_count": 0,
+                "suggested_price": 0,
+                "margin_suggestion": "No disponible",
+                "category": item.get("category", ""),
+                "asin": "",
+                "score": 0,
+                "data_source": "UPCitemdb (Free) ⭐",
+                "timestamp": datetime.now().isoformat()
+            }
+            
+            logger.info(f"✅ UPCitemdb ÉXITO: {formatted_data['name'][:50]}")
+            return {"status": "success", "data": formatted_data}
+    
+    except Exception as e:
+        logger.warning(f"⚠️  UPCitemdb falló: {str(e)}")
+    
+    # ══════════════════════════════════════════════════════════════════════════════════
+    # PASO 3: FALLBACK A OpenFoodFacts (GRATUITO, para alimentos)
+    # ══════════════════════════════════════════════════════════════════════════════════
+    
+    try:
+        logger.info(f"🔍 Intentando OpenFoodFacts: {keywords}")
+        response = requests.get(
+            f"https://world.openfoodfacts.org/api/v2/product/{keywords}.json",
+            timeout=8
+        )
+        data = response.json()
+        
+        if data.get("status") == 1 and data.get("product"):
+            product = data["product"]
+            formatted_data = {
+                "upc": keywords,
+                "name": product.get("product_name_en") or product.get("product_name") or "Unknown",
+                "brand": product.get("brands", ""),
+                "ebay_price": 0,
+                "amazon_price": 0,
+                "walmart_price": 0,
+                "demand_level": "UNKNOWN",
+                "sellers_count": 0,
+                "suggested_price": 0,
+                "margin_suggestion": "No disponible",
+                "category": product.get("categories", ""),
+                "asin": "",
+                "score": 0,
+                "data_source": "OpenFoodFacts (Free) ⭐",
+                "timestamp": datetime.now().isoformat()
+            }
+            
+            logger.info(f"✅ OpenFoodFacts ÉXITO: {formatted_data['name'][:50]}")
+            return {"status": "success", "data": formatted_data}
+    
+    except Exception as e:
+        logger.warning(f"⚠️  OpenFoodFacts falló: {str(e)}")
+    
+    # ══════════════════════════════════════════════════════════════════════════════════
+    # TODOS LOS SERVICIOS FALLARON
+    # ══════════════════════════════════════════════════════════════════════════════════
+    
+    logger.error(f"❌ TODOS LOS SERVICIOS FALLARON para: {keywords}")
+    return {
+        "status": "error",
+        "message": "Producto no encontrado en ningún servicio",
+        "services_tried": ["Algopix", "UPCitemdb", "OpenFoodFacts"],
+        "upc": keywords
+    }
 
 
 def _extract_price(offers, marketplace):
