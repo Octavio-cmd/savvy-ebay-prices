@@ -13,6 +13,8 @@ import os
 import json
 from datetime import datetime
 import logging
+import base64
+import time
 
 # Configuración de logging
 logging.basicConfig(level=logging.INFO)
@@ -38,6 +40,21 @@ ALGOPIX_HEADERS = {
     "X-API-KEY": ALGOPIX_API_KEY,
     "X-APP-ID": ALGOPIX_APP_ID,
     "Content-Type": "application/json"
+}
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# EBAY OAUTH & BROWSE API (REST API)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+EBAY_CLIENT_ID = "StevenGa-SavvySca-PRD-81addb012-655f2649"
+EBAY_CLIENT_SECRET = "PRD-1addb012c112-1d46-4c31-9731-99d5"
+EBAY_OAUTH_URL = "https://api.ebay.com/identity/v1/oauth2/token"
+EBAY_BROWSE_API_URL = "https://api.ebay.com/buy/browse/v1/item_summary/search"
+
+# Cache para OAuth token (expires en 2 horas)
+EBAY_TOKEN_CACHE = {
+    "token": None,
+    "expires_at": 0
 }
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -237,6 +254,109 @@ def quota():
     })
 
 
+# ══════════════════════════════════════════════════════════════════════════════════
+# EBAY OAUTH & BROWSE API FUNCTIONS
+# ══════════════════════════════════════════════════════════════════════════════════
+
+def _get_ebay_token():
+    """Obtiene un OAuth token de eBay (válido por 2 horas)"""
+    import time
+    import base64
+    
+    # Si tenemos un token válido en caché, lo retornamos
+    if EBAY_TOKEN_CACHE["token"] and time.time() < EBAY_TOKEN_CACHE["expires_at"]:
+        logger.info("🔐 Usando eBay token en caché")
+        return EBAY_TOKEN_CACHE["token"]
+    
+    try:
+        logger.info("🔐 Obteniendo nuevo eBay OAuth token...")
+        
+        # Encode credentials en base64
+        credentials = f"{EBAY_CLIENT_ID}:{EBAY_CLIENT_SECRET}"
+        encoded = base64.b64encode(credentials.encode()).decode()
+        
+        response = requests.post(
+            EBAY_OAUTH_URL,
+            headers={
+                "Authorization": f"Basic {encoded}",
+                "Content-Type": "application/x-www-form-urlencoded"
+            },
+            data="grant_type=client_credentials&scope=https://api.ebay.com/oauth/api_scope/buy.browse.readonly",
+            timeout=10
+        )
+        
+        if response.status_code == 200:
+            data = response.json()
+            token = data.get("access_token")
+            expires_in = data.get("expires_in", 7200)  # Default 2 horas
+            
+            # Guardar en caché
+            EBAY_TOKEN_CACHE["token"] = token
+            EBAY_TOKEN_CACHE["expires_at"] = time.time() + expires_in - 60  # Refresh 60s antes
+            
+            logger.info(f"✅ eBay token obtenido (expires en {expires_in}s)")
+            return token
+        else:
+            logger.error(f"❌ eBay OAuth error: {response.status_code} - {response.text}")
+            return None
+    
+    except Exception as e:
+        logger.error(f"❌ Error obteniendo eBay token: {str(e)}")
+        return None
+
+
+def _get_ebay_price(keywords):
+    """Busca en eBay Browse API y retorna el precio más bajo"""
+    try:
+        token = _get_ebay_token()
+        if not token:
+            logger.warning("⚠️  No se pudo obtener token de eBay")
+            return None
+        
+        logger.info(f"🔍 Buscando en eBay: {keywords}")
+        
+        response = requests.get(
+            EBAY_BROWSE_API_URL,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "X-EBAY-C-MARKETPLACE-ID": "EBAY_US"
+            },
+            params={
+                "q": keywords,
+                "limit": 10,
+                "sort": "price"
+            },
+            timeout=10
+        )
+        
+        if response.status_code == 200:
+            data = response.json()
+            items = data.get("itemSummaries", [])
+            
+            if items:
+                # Obtener el primer item (precio más bajo)
+                item = items[0]
+                price_obj = item.get("price", {})
+                
+                if isinstance(price_obj, dict):
+                    price_value = price_obj.get("value")
+                else:
+                    price_value = float(price_obj) if price_obj else 0
+                
+                logger.info(f"✅ eBay encontró: {item.get('title', 'Unknown')} - ${price_value}")
+                return float(price_value) if price_value else 0
+            else:
+                logger.warning(f"⚠️  eBay no encontró: {keywords}")
+                return None
+        else:
+            logger.warning(f"⚠️  eBay Browse API error: {response.status_code}")
+            return None
+    
+    except Exception as e:
+        logger.error(f"❌ Error en eBay Browse API: {str(e)}")
+        return None
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # FUNCIÓN PRINCIPAL
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -312,25 +432,42 @@ def _call_algopix_search(keywords):
         
         if data.get("items") and len(data["items"]) > 0:
             item = data["items"][0]
+            product_name = item.get("title") or item.get("description") or "Unknown"
+            
+            # Intenta obtener el precio de eBay usando Browse API
+            logger.info(f"📊 Buscando precio en eBay para: {product_name}")
+            ebay_price = _get_ebay_price(product_name)
+            
+            # Calcula precio sugerido si encontró precio de eBay
+            if ebay_price and ebay_price > 0:
+                suggested_price = round(ebay_price * 1.15, 2)
+                margin = _calculate_margin(ebay_price, suggested_price)
+                data_source = "UPCitemdb + eBay Browse API 🌟"
+            else:
+                suggested_price = 0
+                margin = "No disponible"
+                ebay_price = 0
+                data_source = "UPCitemdb (Free) ⭐"
+            
             formatted_data = {
                 "upc": keywords,
-                "name": item.get("title") or item.get("description") or "Unknown",
+                "name": product_name,
                 "brand": item.get("brand", ""),
-                "ebay_price": 0,
+                "ebay_price": round(ebay_price, 2) if ebay_price else 0,
                 "amazon_price": 0,
                 "walmart_price": 0,
                 "demand_level": "UNKNOWN",
                 "sellers_count": 0,
-                "suggested_price": 0,
-                "margin_suggestion": "No disponible",
+                "suggested_price": suggested_price,
+                "margin_suggestion": margin,
                 "category": item.get("category", ""),
                 "asin": "",
                 "score": 0,
-                "data_source": "UPCitemdb (Free) ⭐",
+                "data_source": data_source,
                 "timestamp": datetime.now().isoformat()
             }
             
-            logger.info(f"✅ UPCitemdb ÉXITO: {formatted_data['name'][:50]}")
+            logger.info(f"✅ UPCitemdb ÉXITO: {formatted_data['name'][:50]} - eBay: ${formatted_data['ebay_price']}")
             return {"status": "success", "data": formatted_data}
     
     except Exception as e:
