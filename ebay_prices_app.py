@@ -27,7 +27,7 @@ CORS(app)
 
 ALGOPIX_APP_ID = os.environ.get("ALGOPIX_APP_ID", "")
 ALGOPIX_API_KEY = os.environ.get("ALGOPIX_API_KEY", "")
-ALGOPIX_API_URL = "https://api.algopix.ai/v3/search"
+ALGOPIX_API_URL = "https://api.algopix.ai/v3/products/matches"
 
 # Validación de credenciales
 if not ALGOPIX_APP_ID or not ALGOPIX_API_KEY:
