@@ -94,6 +94,7 @@ def search_upc():
         logger.info(f"✅ CACHE HIT: {cache_key}")
         return jsonify({
             "data": CACHE[cache_key],
+            "status": "success",
             "cached": True,
             "message": "Datos obtenidos del caché"
         })
