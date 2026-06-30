@@ -261,9 +261,19 @@ def _call_ebay_search_by_upc(upc):
         is_numeric_upc = upc.isdigit() and 8 <= len(upc) <= 14
 
         if is_numeric_upc:
-            params = {"gtin": upc, "limit": "5"}
+            params = {
+                "gtin": upc,
+                "limit": "5",
+                "filter": "buyingOptions:{FIXED_PRICE}",
+                "sort": "price"
+            }
         else:
-            params = {"q": upc, "limit": "5"}
+            params = {
+                "q": upc,
+                "limit": "5",
+                "filter": "buyingOptions:{FIXED_PRICE}",
+                "sort": "price"
+            }
 
         logger.info(f"🛒 Buscando en eBay ({'gtin' if is_numeric_upc else 'keyword'}): {upc}")
         resp = requests.get(search_url, headers=headers, params=params, timeout=10)
@@ -278,7 +288,12 @@ def _call_ebay_search_by_upc(upc):
 
         # Si la búsqueda por gtin no encontró nada, reintenta por keyword
         if not items and is_numeric_upc:
-            params = {"q": upc, "limit": "5"}
+            params = {
+                "q": upc,
+                "limit": "5",
+                "filter": "buyingOptions:{FIXED_PRICE}",
+                "sort": "price"
+            }
             resp = requests.get(search_url, headers=headers, params=params, timeout=10)
             if resp.status_code == 200:
                 items = resp.json().get("itemSummaries", [])
@@ -291,6 +306,16 @@ def _call_ebay_search_by_upc(upc):
         price_obj = item.get("price", {})
         price = float(price_obj.get("value", 0)) if price_obj else 0.0
 
+        # Extraer costo de envío del primer resultado
+        shipping_cost = 0.0
+        shipping_options = item.get("shippingOptions", [])
+        if shipping_options:
+            ship_obj = shipping_options[0].get("shippingCost", {})
+            if ship_obj:
+                shipping_cost = float(ship_obj.get("value", 0))
+
+        total_price = round(price + shipping_cost, 2)
+
         brand = ""
         for aspect_group in [item]:
             pass  # item_summary no siempre trae aspects; se deja vacío si no viene
@@ -300,11 +325,13 @@ def _call_ebay_search_by_upc(upc):
             "name": item.get("title", "Unknown"),
             "brand": brand,
             "ebay_price": round(price, 2),
+            "ebay_shipping": round(shipping_cost, 2),
+            "ebay_total": total_price,
             "amazon_price": 0,
             "walmart_price": 0,
             "demand_level": "UNKNOWN",
             "sellers_count": 0,
-            "suggested_price": round(price * 0.75, 2) if price > 0 else 0,
+            "suggested_price": round(total_price * 0.95, 2) if total_price > 0 else 0,
             "margin_suggestion": "",
             "category": item.get("categories", [{}])[0].get("categoryName", "") if item.get("categories") else "",
             "asin": "",
@@ -315,7 +342,7 @@ def _call_ebay_search_by_upc(upc):
             "timestamp": datetime.now().isoformat()
         }
 
-        logger.info(f"✅ eBay ÉXITO: {formatted_data['name'][:50]} | ${price}")
+        logger.info(f"✅ eBay ÉXITO: {formatted_data['name'][:50]} | item=${price} ship=${shipping_cost} total=${total_price}")
         return formatted_data
 
     except Exception as e:
