@@ -242,11 +242,101 @@ def quota():
 # FUNCIÓN PRINCIPAL
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+def _call_ebay_search_by_upc(upc):
+    """
+    Busca un producto en eBay Browse API por UPC/GTIN o palabra clave.
+    Usa el endpoint item_summary/search con filtro gtin cuando el código
+    parece un UPC numérico válido (8-14 dígitos), si no, busca por keyword.
+    Devuelve None si no encuentra nada (para poder seguir la cascada a Algopix).
+    """
+    try:
+        token = _get_ebay_token()
+        if not token:
+            logger.warning("⚠️  eBay: no se pudo obtener token")
+            return None
+
+        headers = {"Authorization": f"Bearer {token}", "X-EBAY-C-MARKETPLACE-ID": "EBAY_US"}
+        search_url = "https://api.ebay.com/buy/browse/v1/item_summary/search"
+
+        is_numeric_upc = upc.isdigit() and 8 <= len(upc) <= 14
+
+        if is_numeric_upc:
+            params = {"gtin": upc, "limit": "5"}
+        else:
+            params = {"q": upc, "limit": "5"}
+
+        logger.info(f"🛒 Buscando en eBay ({'gtin' if is_numeric_upc else 'keyword'}): {upc}")
+        resp = requests.get(search_url, headers=headers, params=params, timeout=10)
+        logger.info(f"   eBay search status: {resp.status_code}")
+
+        if resp.status_code != 200:
+            logger.warning(f"⚠️  eBay search falló: {resp.status_code} - {resp.text[:200]}")
+            return None
+
+        data = resp.json()
+        items = data.get("itemSummaries", [])
+
+        # Si la búsqueda por gtin no encontró nada, reintenta por keyword
+        if not items and is_numeric_upc:
+            params = {"q": upc, "limit": "5"}
+            resp = requests.get(search_url, headers=headers, params=params, timeout=10)
+            if resp.status_code == 200:
+                items = resp.json().get("itemSummaries", [])
+
+        if not items:
+            logger.info("   eBay: sin resultados")
+            return None
+
+        item = items[0]
+        price_obj = item.get("price", {})
+        price = float(price_obj.get("value", 0)) if price_obj else 0.0
+
+        brand = ""
+        for aspect_group in [item]:
+            pass  # item_summary no siempre trae aspects; se deja vacío si no viene
+
+        formatted_data = {
+            "upc": upc,
+            "name": item.get("title", "Unknown"),
+            "brand": brand,
+            "ebay_price": round(price, 2),
+            "amazon_price": 0,
+            "walmart_price": 0,
+            "demand_level": "UNKNOWN",
+            "sellers_count": 0,
+            "suggested_price": round(price * 0.75, 2) if price > 0 else 0,
+            "margin_suggestion": "",
+            "category": item.get("categories", [{}])[0].get("categoryName", "") if item.get("categories") else "",
+            "asin": "",
+            "score": 0,
+            "data_source": "eBay ✅",
+            "ebay_item_id": item.get("itemId", ""),
+            "ebay_url": item.get("itemWebUrl", ""),
+            "timestamp": datetime.now().isoformat()
+        }
+
+        logger.info(f"✅ eBay ÉXITO: {formatted_data['name'][:50]} | ${price}")
+        return formatted_data
+
+    except Exception as e:
+        logger.warning(f"⚠️  eBay search error: {str(e)}")
+        return None
+
+
 def _call_algopix_search(keywords):
     """
-    Intenta Algopix primero. Si falla, usa APIs gratuitas (UPCitemdb, OpenFoodFacts)
+    Cascada de búsqueda: eBay primero (más confiable para tu negocio),
+    luego Algopix, luego APIs gratuitas (UPCitemdb, OpenFoodFacts)
     """
-    
+
+    # ══════════════════════════════════════════════════════════════════════════════════
+    # PASO 0: INTENTA EBAY PRIMERO
+    # ══════════════════════════════════════════════════════════════════════════════════
+
+    ebay_result = _call_ebay_search_by_upc(keywords)
+    if ebay_result:
+        return {"status": "success", "data": ebay_result}
+
     # ══════════════════════════════════════════════════════════════════════════════════
     # PASO 1: INTENTA ALGOPIX
     # ══════════════════════════════════════════════════════════════════════════════════
@@ -258,6 +348,7 @@ def _call_algopix_search(keywords):
         response = requests.get(
             ALGOPIX_API_URL,
             params=params,
+
             headers=ALGOPIX_HEADERS,
             timeout=10
         )
