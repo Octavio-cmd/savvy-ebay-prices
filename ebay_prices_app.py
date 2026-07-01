@@ -301,52 +301,82 @@ def _call_ebay_search_by_upc(upc):
             return None
 
         # Calcular precio total (precio + envío) para cada item
-        def get_total(it):
-            p = float((it.get("price") or {}).get("value", 0))
+        def get_shipping_from_summary(it):
             ships = it.get("shippingOptions") or []
-            s = 0.0
-            if ships:
+            if not ships:
+                return None  # None = desconocido, no gratuito
+            sc = (ships[0].get("shippingCost") or {})
+            return round(float(sc.get("value", 0)), 2)
+
+        def get_total_from_summary(it):
+            p = round(float((it.get("price") or {}).get("value", 0)), 2)
+            s = get_shipping_from_summary(it)
+            if s is None:
+                return None, p, None  # total desconocido
+            return round(p + s, 2), p, s
+
+        def get_shipping_from_item_detail(item_id):
+            """Llama al endpoint /item/{itemId} para obtener envío real."""
+            try:
+                r = requests.get(
+                    f"https://api.ebay.com/buy/browse/v1/item/{item_id}",
+                    headers=headers, timeout=8
+                )
+                if r.status_code != 200:
+                    return None
+                detail = r.json()
+                ships = detail.get("shippingOptions") or []
+                if not ships:
+                    return 0.0
                 sc = (ships[0].get("shippingCost") or {})
-                s = float(sc.get("value", 0))
-            return round(p + s, 2), round(p, 2), round(s, 2)
+                cost = round(float(sc.get("value", 0)), 2)
+                logger.info(f"   🚚 Envío real (item detail): ${cost}")
+                return cost
+            except Exception as ex:
+                logger.warning(f"   ⚠️ No se pudo obtener envío: {ex}")
+                return None
 
         # Log de todos los precios para debug
         for it in items[:5]:
-            t, p, s = get_total(it)
+            total, p, s = get_total_from_summary(it)
             loc = (it.get("itemLocation") or {}).get("country", "??")
-            logger.info(f"   📦 ${t} (item=${p} ship=${s}) [{loc}] — {it.get('title','')[:40]}")
+            logger.info(f"   📦 total={total} (item=${p} ship={s}) [{loc}] — {it.get('title','')[:40]}")
 
         # eBay Browse API devuelve código de país "US", no "United States"
         usa_items = [it for it in items if (it.get("itemLocation") or {}).get("country", "") in ("US", "United States")]
         other_items = [it for it in items if it not in usa_items]
 
         # Encontrar el más barato primero en USA, luego en otros
+        # Usamos solo el precio del item para ordenar (sin envío aún, porque puede ser desconocido)
+        # Luego consultamos el detalle de envío del ganador
         best_item = None
-        best_total = None
         best_price = None
-        best_shipping = None
 
         for pool in [usa_items, other_items]:
             if not pool:
                 continue
             for it in pool:
-                total, price, shipping = get_total(it)
-                if total > 0 and (best_total is None or total < best_total):
-                    best_total = total
-                    best_price = price
-                    best_shipping = shipping
+                p = round(float((it.get("price") or {}).get("value", 0)), 2)
+                if p > 0 and (best_price is None or p < best_price):
+                    best_price = p
                     best_item = it
             if best_item and best_item in usa_items:
                 break
 
-        # Si no hubo nada con precio válido, tomar el primero
         if not best_item:
             best_item = items[0]
-            best_total, best_price, best_shipping = get_total(best_item)
-            if best_total == 0:
-                best_total = best_price = 0.0
-                best_shipping = 0.0
+            best_price = round(float((best_item.get("price") or {}).get("value", 0)), 2)
 
+        # Intentar obtener el envío real del mejor item
+        best_item_id = best_item.get("itemId", "")
+        best_shipping = get_shipping_from_summary(best_item)
+        if best_shipping is None and best_item_id:
+            # No vino en el summary, consultamos el detalle
+            best_shipping = get_shipping_from_item_detail(best_item_id)
+        if best_shipping is None:
+            best_shipping = 0.0  # Fallback si no se pudo obtener
+
+        best_total = round(best_price + best_shipping, 2)
         location = (best_item.get("itemLocation") or {}).get("country", "")
         logger.info(f"✅ eBay MEJOR PRECIO: '{best_item.get('title','')[:50]}' | "
                     f"item=${best_price} + ship=${best_shipping} = total=${best_total} [{location}]")
