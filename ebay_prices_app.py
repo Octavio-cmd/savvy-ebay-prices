@@ -302,14 +302,21 @@ def _call_ebay_search_by_upc(upc):
             logger.info(f"🛒 eBay GTIN '{upc}': {len(gtin_items)} resultados")
             items = gtin_items
 
-        # Intento 2: búsqueda por keyword con el mismo UPC para más cobertura
-        # (eBay API por GTIN a veces devuelve muy pocos resultados)
-        keyword_items = _fetch_items({
-            "q": upc, "limit": "20",
-            "filter": "buyingOptions:{FIXED_PRICE}",
-            "sort": "price"
-        })
-        logger.info(f"🛒 eBay keyword '{upc}': {len(keyword_items)} resultados")
+        # Intento 2: si GTIN dio pocos resultados, buscar por NOMBRE del producto
+        # (NO por el número UPC como keyword — eso trae productos no relacionados)
+        keyword_items = []
+        if len(items) < 8:
+            # Extraer el nombre del primer resultado de GTIN para buscar por título
+            product_name = items[0].get("title", "") if items else ""
+            # Si no hay nombre de GTIN, usar el UPC solo si es alfanumérico (código de modelo)
+            search_q = product_name[:80] if product_name else (upc if not is_numeric_upc else "")
+            if search_q:
+                keyword_items = _fetch_items({
+                    "q": search_q, "limit": "20",
+                    "filter": "buyingOptions:{FIXED_PRICE}",
+                    "sort": "price"
+                })
+                logger.info(f"🛒 eBay keyword (nombre): {len(keyword_items)} resultados")
 
         # Combinar ambas listas eliminando duplicados por itemId
         seen_ids = set()
