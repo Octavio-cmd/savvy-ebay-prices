@@ -392,14 +392,22 @@ def _call_ebay_search_by_upc(upc):
             best_item = items[0]
             best_price = round(float((best_item.get("price") or {}).get("value", 0)), 2)
 
-        # Intentar obtener el envío real del mejor item
+        # Intentar obtener el envío real del mejor item via /item/{itemId}
+        # (el summary de búsqueda no siempre trae el costo correcto,
+        #  especialmente en listings con "or Best Offer" o envío variable)
         best_item_id = best_item.get("itemId", "")
-        best_shipping = get_shipping_from_summary(best_item)
-        if best_shipping is None and best_item_id:
-            # No vino en el summary, consultamos el detalle
+        best_shipping = None
+
+        if best_item_id:
             best_shipping = get_shipping_from_item_detail(best_item_id)
+
+        # Si el detalle tampoco dio envío, intentar leer del summary como fallback
         if best_shipping is None:
-            best_shipping = 0.0  # Fallback si no se pudo obtener
+            best_shipping = get_shipping_from_summary(best_item)
+
+        # Si aún no hay dato, asumir 0
+        if best_shipping is None:
+            best_shipping = 0.0
 
         best_total = round(best_price + best_shipping, 2)
         location = (best_item.get("itemLocation") or {}).get("country", "")
