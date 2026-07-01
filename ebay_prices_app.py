@@ -298,8 +298,14 @@ def _call_ebay_search_by_upc(upc):
                 s = float(sc.get("value", 0))
             return round(p + s, 2), round(p, 2), round(s, 2)
 
-        # Separar items de USA vs otros (China, etc.)
-        usa_items = [it for it in items if "United States" in (it.get("itemLocation") or {}).get("country", "")]
+        # Log de todos los precios para debug
+        for it in items[:5]:
+            t, p, s = get_total(it)
+            loc = (it.get("itemLocation") or {}).get("country", "??")
+            logger.info(f"   📦 ${t} (item=${p} ship=${s}) [{loc}] — {it.get('title','')[:40]}")
+
+        # eBay Browse API devuelve código de país "US", no "United States"
+        usa_items = [it for it in items if (it.get("itemLocation") or {}).get("country", "") in ("US", "United States")]
         other_items = [it for it in items if it not in usa_items]
 
         # Encontrar el más barato primero en USA, luego en otros
