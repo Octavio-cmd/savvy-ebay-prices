@@ -76,6 +76,7 @@ def health():
     """Health check endpoint"""
     return jsonify({
         "status": "online",
+        "version": "v7-shipping-detail",
         "service": "Savvy Scanner - Algopix Backend",
         "timestamp": datetime.now().isoformat(),
         "lookups_today": LOOKUP_COUNT["today"],
@@ -399,11 +400,14 @@ def _call_ebay_search_by_upc(upc):
         best_shipping = None
 
         if best_item_id:
+            logger.info(f"   🔎 Consultando detalle del item: {best_item_id}")
             best_shipping = get_shipping_from_item_detail(best_item_id)
+            logger.info(f"   📬 Resultado detalle: shipping={best_shipping}")
 
         # Si el detalle tampoco dio envío, intentar leer del summary como fallback
         if best_shipping is None:
             best_shipping = get_shipping_from_summary(best_item)
+            logger.info(f"   📬 Fallback summary: shipping={best_shipping}")
 
         # Si aún no hay dato, asumir 0
         if best_shipping is None:
