@@ -383,6 +383,15 @@ def _call_ebay_search_by_upc(upc):
                 continue
             for it in pool:
                 p = round(float((it.get("price") or {}).get("value", 0)), 2)
+                # Excluir listings con "Best Offer" — su envío siempre aparece como $0
+                # aunque realmente cobren envío
+                buying_options = it.get("buyingOptions") or []
+                has_best_offer_only = buying_options == ["BEST_OFFER"] or \
+                    (len(buying_options) == 2 and "BEST_OFFER" in buying_options and "FIXED_PRICE" in buying_options and
+                     not (it.get("shippingOptions") or []))
+                if has_best_offer_only:
+                    logger.info(f"   ⏭ Saltando listing con Best Offer: ${p} — {it.get('title','')[:30]}")
+                    continue
                 if p > 0 and (best_price is None or p < best_price):
                     best_price = p
                     best_item = it
