@@ -244,10 +244,9 @@ def quota():
 
 def _call_ebay_search_by_upc(upc):
     """
-    Busca un producto en eBay Browse API por UPC/GTIN o palabra clave.
-    Usa el endpoint item_summary/search con filtro gtin cuando el código
-    parece un UPC numérico válido (8-14 dígitos), si no, busca por keyword.
-    Devuelve None si no encuentra nada (para poder seguir la cascada a Algopix).
+    Busca en eBay por UPC/GTIN y devuelve el precio total más barato
+    (precio + envío) entre los primeros 20 resultados Buy It Now.
+    Prefiere vendedores de USA sobre China si el precio es similar.
     """
     try:
         token = _get_ebay_token()
@@ -257,98 +256,110 @@ def _call_ebay_search_by_upc(upc):
 
         headers = {"Authorization": f"Bearer {token}", "X-EBAY-C-MARKETPLACE-ID": "EBAY_US"}
         search_url = "https://api.ebay.com/buy/browse/v1/item_summary/search"
-
         is_numeric_upc = upc.isdigit() and 8 <= len(upc) <= 14
 
+        def _fetch_items(params):
+            r = requests.get(search_url, headers=headers, params=params, timeout=10)
+            logger.info(f"   eBay status: {r.status_code}")
+            if r.status_code == 200:
+                return r.json().get("itemSummaries", [])
+            return []
+
+        # Intento 1: búsqueda por GTIN (más preciso)
+        items = []
         if is_numeric_upc:
-            params = {
-                "gtin": upc,
-                "limit": "5",
+            items = _fetch_items({
+                "gtin": upc, "limit": "20",
                 "filter": "buyingOptions:{FIXED_PRICE}",
                 "sort": "price"
-            }
-        else:
-            params = {
-                "q": upc,
-                "limit": "5",
+            })
+            logger.info(f"🛒 eBay GTIN '{upc}': {len(items)} resultados")
+
+        # Intento 2: si GTIN no dio nada, buscar por keyword
+        if not items:
+            items = _fetch_items({
+                "q": upc, "limit": "20",
                 "filter": "buyingOptions:{FIXED_PRICE}",
                 "sort": "price"
-            }
-
-        logger.info(f"🛒 Buscando en eBay ({'gtin' if is_numeric_upc else 'keyword'}): {upc}")
-        resp = requests.get(search_url, headers=headers, params=params, timeout=10)
-        logger.info(f"   eBay search status: {resp.status_code}")
-
-        if resp.status_code != 200:
-            logger.warning(f"⚠️  eBay search falló: {resp.status_code} - {resp.text[:200]}")
-            return None
-
-        data = resp.json()
-        items = data.get("itemSummaries", [])
-
-        # Si la búsqueda por gtin no encontró nada, reintenta por keyword
-        if not items and is_numeric_upc:
-            params = {
-                "q": upc,
-                "limit": "5",
-                "filter": "buyingOptions:{FIXED_PRICE}",
-                "sort": "price"
-            }
-            resp = requests.get(search_url, headers=headers, params=params, timeout=10)
-            if resp.status_code == 200:
-                items = resp.json().get("itemSummaries", [])
+            })
+            logger.info(f"🛒 eBay keyword '{upc}': {len(items)} resultados")
 
         if not items:
             logger.info("   eBay: sin resultados")
             return None
 
-        item = items[0]
-        price_obj = item.get("price", {})
-        price = float(price_obj.get("value", 0)) if price_obj else 0.0
+        # Calcular precio total (precio + envío) para cada item
+        def get_total(it):
+            p = float((it.get("price") or {}).get("value", 0))
+            ships = it.get("shippingOptions") or []
+            s = 0.0
+            if ships:
+                sc = (ships[0].get("shippingCost") or {})
+                s = float(sc.get("value", 0))
+            return round(p + s, 2), round(p, 2), round(s, 2)
 
-        # Extraer costo de envío del primer resultado
-        shipping_cost = 0.0
-        shipping_options = item.get("shippingOptions", [])
-        if shipping_options:
-            ship_obj = shipping_options[0].get("shippingCost", {})
-            if ship_obj:
-                shipping_cost = float(ship_obj.get("value", 0))
+        # Separar items de USA vs otros (China, etc.)
+        usa_items = [it for it in items if "United States" in (it.get("itemLocation") or {}).get("country", "")]
+        other_items = [it for it in items if it not in usa_items]
 
-        total_price = round(price + shipping_cost, 2)
+        # Encontrar el más barato primero en USA, luego en otros
+        best_item = None
+        best_total = None
+        best_price = None
+        best_shipping = None
 
-        brand = ""
-        for aspect_group in [item]:
-            pass  # item_summary no siempre trae aspects; se deja vacío si no viene
+        for pool in [usa_items, other_items]:
+            if not pool:
+                continue
+            for it in pool:
+                total, price, shipping = get_total(it)
+                if total > 0 and (best_total is None or total < best_total):
+                    best_total = total
+                    best_price = price
+                    best_shipping = shipping
+                    best_item = it
+            if best_item and best_item in usa_items:
+                break
+
+        # Si no hubo nada con precio válido, tomar el primero
+        if not best_item:
+            best_item = items[0]
+            best_total, best_price, best_shipping = get_total(best_item)
+            if best_total == 0:
+                best_total = best_price = 0.0
+                best_shipping = 0.0
+
+        location = (best_item.get("itemLocation") or {}).get("country", "")
+        logger.info(f"✅ eBay MEJOR PRECIO: '{best_item.get('title','')[:50]}' | "
+                    f"item=${best_price} + ship=${best_shipping} = total=${best_total} [{location}]")
 
         formatted_data = {
             "upc": upc,
-            "name": item.get("title", "Unknown"),
-            "brand": brand,
-            "ebay_price": round(price, 2),
-            "ebay_shipping": round(shipping_cost, 2),
-            "ebay_total": total_price,
+            "name": best_item.get("title", "Unknown"),
+            "brand": "",
+            "ebay_price": best_price,
+            "ebay_shipping": best_shipping,
+            "ebay_total": best_total,
             "amazon_price": 0,
             "walmart_price": 0,
             "demand_level": "UNKNOWN",
-            "sellers_count": 0,
-            "suggested_price": round(total_price * 0.95, 2) if total_price > 0 else 0,
+            "sellers_count": len(items),
+            "suggested_price": round(best_total * 0.95, 2) if best_total > 0 else 0,
             "margin_suggestion": "",
-            "category": item.get("categories", [{}])[0].get("categoryName", "") if item.get("categories") else "",
+            "category": ((best_item.get("categories") or [{}])[0]).get("categoryName", ""),
             "asin": "",
             "score": 0,
             "data_source": "eBay ✅",
-            "ebay_item_id": item.get("itemId", ""),
-            "ebay_url": item.get("itemWebUrl", ""),
+            "ebay_item_id": best_item.get("itemId", ""),
+            "ebay_url": best_item.get("itemWebUrl", ""),
+            "ebay_location": location,
             "timestamp": datetime.now().isoformat()
         }
-
-        logger.info(f"✅ eBay ÉXITO: {formatted_data['name'][:50]} | item=${price} ship=${shipping_cost} total=${total_price}")
         return formatted_data
 
     except Exception as e:
         logger.warning(f"⚠️  eBay search error: {str(e)}")
         return None
-
 
 def _call_algopix_search(keywords):
     """
