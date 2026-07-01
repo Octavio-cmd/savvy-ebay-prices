@@ -41,10 +41,26 @@ ALGOPIX_HEADERS = {
 }
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# CACHÉ EN MEMORIA
+# CACHÉ EN MEMORIA CON EXPIRACIÓN (30 minutos)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-CACHE = {}
+CACHE = {}  # {key: {"data": ..., "ts": datetime}}
+CACHE_TTL_MINUTES = 30
+
+def cache_get(key):
+    entry = CACHE.get(key)
+    if not entry:
+        return None
+    age = (datetime.now() - entry["ts"]).total_seconds() / 60
+    if age > CACHE_TTL_MINUTES:
+        del CACHE[key]
+        logger.info(f"🗑 Caché expirado: {key} ({age:.1f} min)")
+        return None
+    return entry["data"]
+
+def cache_set(key, data):
+    CACHE[key] = {"data": data, "ts": datetime.now()}
+
 LOOKUP_COUNT = {
     "total": 0,
     "today": 0,
@@ -90,10 +106,11 @@ def search_upc():
     
     # CACHÉ
     cache_key = f"upc_{upc}" if upc else f"search_{search_term}"
-    if cache_key in CACHE:
+    cached_data = cache_get(cache_key)
+    if cached_data:
         logger.info(f"✅ CACHE HIT: {cache_key}")
         return jsonify({
-            "data": CACHE[cache_key],
+            "data": cached_data,
             "status": "success",
             "cached": True,
             "message": "Datos obtenidos del caché"
@@ -105,7 +122,7 @@ def search_upc():
         response = _call_algopix_search(upc or search_term)
         
         if response.get("status") == "success":
-            CACHE[cache_key] = response.get("data", {})
+            cache_set(cache_key, response.get("data", {}))
             LOOKUP_COUNT["total"] += 1
             LOOKUP_COUNT["today"] += 1
             
@@ -220,6 +237,14 @@ def test_algopix():
             "status": "error"
         }), 500
 
+
+@app.route('/clear-cache', methods=['GET'])
+def clear_cache():
+    """Limpia el caché en memoria manualmente"""
+    count = len(CACHE)
+    CACHE.clear()
+    logger.info(f"🗑 Caché limpiado manualmente: {count} entradas eliminadas")
+    return jsonify({"status": "ok", "message": f"Caché limpiado: {count} entradas eliminadas"})
 
 @app.route('/quota', methods=['GET'])
 def quota():
@@ -684,8 +709,9 @@ def ebay_item():
         return jsonify({"error": "item_id inválido", "status": "error"}), 400
 
     cache_key = f"ebay_item_{item_id}"
-    if cache_key in CACHE:
-        return jsonify({"data": CACHE[cache_key], "cached": True, "status": "success"})
+    cached_data = cache_get(cache_key)
+    if cached_data:
+        return jsonify({"data": cached_data, "cached": True, "status": "success"})
 
     logger.info(f"🛒 Buscando eBay item: {item_id}")
 
@@ -762,7 +788,7 @@ def ebay_item():
         }
 
         logger.info(f"✅ eBay item: {formatted['title'][:50]} | item=${price} ship=${shipping_cost} total=${total_price}")
-        CACHE[cache_key] = formatted
+        cache_set(cache_key, formatted)
         return jsonify({"data": formatted, "status": "success", "cached": False})
 
     except Exception as e:
