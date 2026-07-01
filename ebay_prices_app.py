@@ -268,21 +268,33 @@ def _call_ebay_search_by_upc(upc):
         # Intento 1: búsqueda por GTIN (más preciso)
         items = []
         if is_numeric_upc:
-            items = _fetch_items({
+            gtin_items = _fetch_items({
                 "gtin": upc, "limit": "20",
                 "filter": "buyingOptions:{FIXED_PRICE}",
                 "sort": "price"
             })
-            logger.info(f"🛒 eBay GTIN '{upc}': {len(items)} resultados")
+            logger.info(f"🛒 eBay GTIN '{upc}': {len(gtin_items)} resultados")
+            items = gtin_items
 
-        # Intento 2: si GTIN no dio nada, buscar por keyword
-        if not items:
-            items = _fetch_items({
-                "q": upc, "limit": "20",
-                "filter": "buyingOptions:{FIXED_PRICE}",
-                "sort": "price"
-            })
-            logger.info(f"🛒 eBay keyword '{upc}': {len(items)} resultados")
+        # Intento 2: búsqueda por keyword con el mismo UPC para más cobertura
+        # (eBay API por GTIN a veces devuelve muy pocos resultados)
+        keyword_items = _fetch_items({
+            "q": upc, "limit": "20",
+            "filter": "buyingOptions:{FIXED_PRICE}",
+            "sort": "price"
+        })
+        logger.info(f"🛒 eBay keyword '{upc}': {len(keyword_items)} resultados")
+
+        # Combinar ambas listas eliminando duplicados por itemId
+        seen_ids = set()
+        combined = []
+        for it in (items + keyword_items):
+            iid = it.get("itemId", "")
+            if iid and iid not in seen_ids:
+                seen_ids.add(iid)
+                combined.append(it)
+        items = combined
+        logger.info(f"🛒 eBay total combinado: {len(items)} resultados únicos")
 
         if not items:
             logger.info("   eBay: sin resultados")
